@@ -11,9 +11,9 @@ import numpy as np
 import mne
 
 try:
-    from .config import DEFAULT_RAW_VHDR, DEFAULT_EXPERIMENT, PROJECT_ROOT
+    from .config import DEFAULT_RAW_VHDR, SEGMENTS_DIR
 except ImportError:
-    from config import DEFAULT_RAW_VHDR, DEFAULT_EXPERIMENT, PROJECT_ROOT
+    from config import DEFAULT_RAW_VHDR, SEGMENTS_DIR
 
 
 DETECTION_CHANNELS = ["Fp1", "Fp2", "Fz", "Cz", "Pz"]
@@ -26,9 +26,9 @@ MANUAL_THRESHOLD = 300.0
 
 def detect_mri_sessions(vhdr_path: Path = DEFAULT_RAW_VHDR, output_dir: Path = None):
     vhdr_path = Path(vhdr_path).resolve()
-    if output_dir is None:
-        output_dir = PROJECT_ROOT / DEFAULT_EXPERIMENT
-    segments_dir = Path(output_dir) / "segments"
+    # New layout: segments live under data/<subject>/segments/. `output_dir`,
+    # when given, is treated as the segments directory itself.
+    segments_dir = Path(output_dir) if output_dir is not None else SEGMENTS_DIR
     segments_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
@@ -103,7 +103,7 @@ def detect_mri_sessions(vhdr_path: Path = DEFAULT_RAW_VHDR, output_dir: Path = N
     print(f"\nFound {len(merged)} MRI segments:")
     dur_lines = []
     for idx, (t0, t1) in enumerate(merged, 1):
-        seg_folder = segments_dir / f"segment{idx}"
+        seg_folder = segments_dir / f"segment{idx:02d}"
         seg_folder.mkdir(exist_ok=True)
         dur = t1 - t0
         line = f"Segment {idx}: [{t0:.2f} s - {t1:.2f} s] (Duration: {dur:.1f} s / {dur/60:.1f} min)"

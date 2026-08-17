@@ -12,9 +12,19 @@ EEGLAB_DIR = Path(os.getenv("EEGLAB_DIR", "/home/vitaly/Downloads/eeglab_current
 BERGEN_DIR = Path(os.getenv("BERGEN_DIR", str(EEGLAB_DIR / "plugins" / "BERGEN1.0")))
 
 # Default subject & segment
+# New "data/<subject>" layout (see README):
+#   data/1916/raw/eeg96/1916.vhdr           -> continuous raw recording
+#   data/1916/raw/rp_spm/rp_segment04.txt   -> SPM motion params (per-segment)
+#   data/1916/segments/segment04/           -> per-segment working directory
 DEFAULT_EXPERIMENT = "1916"
-DEFAULT_SEGMENT_DIR = PROJECT_ROOT / DEFAULT_EXPERIMENT / "segments" / "segment4"
-DEFAULT_RAW_VHDR = PROJECT_ROOT / "EEG_files" / DEFAULT_EXPERIMENT / f"{DEFAULT_EXPERIMENT}_inside.vhdr"
+DATA_ROOT = PROJECT_ROOT / "data"
+SUBJECT_DIR = DATA_ROOT / DEFAULT_EXPERIMENT
+RAW_DIR = SUBJECT_DIR / "raw"
+SEGMENTS_DIR = SUBJECT_DIR / "segments"
+RP_DIR = RAW_DIR / "rp_spm"   # subject-level SPM rp_*.txt (one per segment)
+
+DEFAULT_SEGMENT_DIR = SEGMENTS_DIR / "segment04"
+DEFAULT_RAW_VHDR = RAW_DIR / "eeg96" / f"{DEFAULT_EXPERIMENT}.vhdr"
 
 # fMRI sequence default parameters
 DEFAULT_TR_SEC = 2.500
