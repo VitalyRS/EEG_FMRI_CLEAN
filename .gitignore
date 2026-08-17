@@ -1,0 +1,100 @@
+# =====================================================================
+# EEG & fMRI Raw Data and Processed Files (>10 MB & binary data)
+# =====================================================================
+# Raw BrainVision EEG
+*.eeg
+*.vhdr
+*.vmrk
+
+# MNE-Python FIF files
+*.fif
+*.fif.gz
+
+# EEGLAB / MATLAB datasets
+*.set
+*.fdt
+*.mat
+
+# European Data Format & BioSemi
+*.edf
+*.bdf
+*.gdf
+
+# NumPy arrays & scientific data dumps
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+*.dat
+*.bin
+
+# Neuroimaging (NIfTI, DICOM, etc.)
+*.nii
+*.nii.gz
+*.dcm
+
+# Databases (Optuna, SQLite)
+*.db
+*.sqlite
+*.sqlite3
+
+# =====================================================================
+# Data & Subject Output Directories
+# =====================================================================
+EEG_files/
+data/
+raw_data/
+processed_data/
+trial*/
+
+# Subject directories (e.g. 1916/ or any numeric subject folders)
+[0-9]*/
+
+# =====================================================================
+# Python & Environment
+# =====================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# =====================================================================
+# IDEs & System Files
+# =====================================================================
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
