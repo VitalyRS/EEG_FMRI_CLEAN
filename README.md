@@ -1,37 +1,64 @@
-# 🧠 Optuna-Bergen EEG-fMRI Gradient Artifact Removal Pipeline
+# 🧠 Optuna-Bergen EEG-fMRI Artifact Removal Pipeline + BCG + ICA
 
-**High-precision modular software for concurrent EEG-fMRI gradient artifact removal with quantitative alpha rhythm preservation control.**
+**High-precision modular software for concurrent EEG-fMRI gradient artifact removal, BCG (ballistocardiogram) cleaning, and ICA (Independent Component Analysis) with quantitative alpha rhythm preservation control.**
 
-This pipeline combines the vectorized Bergen Average Artifact Subtraction (AAS) algorithm (MATLAB/EEGLAB) with Bayesian multi-objective hyperparameter optimization (Python/Optuna TPE) to remove MRI gradient artifacts from multi-channel EEG recordings (up to 96+ channels at 5000 Hz) while preserving physiological brain rhythms, particularly the alpha band (8–13 Hz).
+⚠️ **Important:** Read [QUALITY_CRITERIA.md](QUALITY_CRITERIA.md) for metrics targets, common pitfalls, and how to diagnose over-cleaning.
+
+This pipeline combines:
+1. **Bergen Average Artifact Subtraction (AAS)** for MRI gradient artifacts
+2. **BCG artifact removal** via MATLAB fMRIB OBS plugin
+3. **ICA with ICLabel** auto-classification and Optuna-optimized `clean_rawdata` parameters
+
+All optimizations use Bayesian multi-objective hyperparameter search (Python/Optuna TPE) to preserve physiological brain rhythms, particularly the alpha band (8–13 Hz).
+
+---
+
+## ⚠️ Quality Targets (Quick Reference)
+
+**After Bergen:**
+- Gradient suppression (20/30/40/50/60 Hz): ≥ 99.5%
+- Alpha retention: ≥ 85%
+
+**After BCG:**
+- Cardiac suppression (0.7–4 Hz): ≥ 20% (lower is acceptable if BCG already weak)
+- Alpha retention: ≥ 60%
+
+**After ICA:**
+- IC rejected: 20–40% (NOT 60–80%!)
+- Variance drop: ≤ 30%
+- Alpha retention: ≥ 70%
+- Channels removed: ≤ 10%
+
+🚩 **Red flags:** IC rejected > 60%, variance drop > 50%, alpha < 60%, central channels (Fz/Cz/CPz) removed → **over-cleaning, adjust parameters!**
+
+See [QUALITY_CRITERIA.md](QUALITY_CRITERIA.md) for full diagnostic guide.
 
 ---
 
 ## 🎯 Core Principles & Scientific Rationale
 
-### 1. **No Blind Destructive Filtering**
-- **Does NOT apply**: notch filters, aggressive low-pass filters (< 40 Hz), ICA, ASR, or BCG filtering.
-- Gradient artifacts are removed exclusively via **mathematical template subtraction** (Bergen AAS), fully preserving waveform morphology and physiological frequency content across the entire EEG spectrum.
+### 1. **Multi-Stage Artifact Removal**
+- **Stage 1: MRI Gradient Artifacts** removed via mathematical template subtraction (Bergen AAS), fully preserving waveform morphology across the entire EEG spectrum.
+- **Stage 2: BCG (Ballistocardiogram)** artifacts removed via Optuna-optimized template subtraction.
+- **Stage 3: Residual Artifacts** removed via ICA with ICLabel auto-classification and Optuna-optimized preprocessing (`clean_rawdata`).
 
 ### 2. **Dual-Objective Quality Control (Multi-Objective Alpha Preservation)**
-- **Objective 1: Gradient Suppression (G_suppression > 99.9%)** on slice harmonics (20, 30, 40, 50, 60 Hz). The 10 Hz harmonic is **excluded** from suppression metrics to avoid artificially penalizing alpha-band preservation.
-- **Objective 2: Alpha Rhythm Preservation (8–13 Hz)**: quantifies alpha peak prominence, peak frequency stability (f_α ≈ 9.8–10.2 Hz), and alpha retention relative to a reference EEG recording outside the scanner (EEG21 dataset).
+- **Objective 1: Artifact Suppression** on gradient harmonics (20, 30, 40, 50, 60 Hz) and BCG/muscle artifacts. The 10 Hz harmonic is **excluded** from suppression metrics to avoid artificially penalizing alpha-band preservation.
+- **Objective 2: Alpha Rhythm Preservation (8–13 Hz)**: quantifies alpha peak prominence, peak frequency stability (f_α ≈ 9.8–10.2 Hz), and alpha retention relative to raw data.
 
 ### 3. **Zero-Data-Duplication Architecture (Zero-Bloat)**
 - Eliminates intermediate gigabyte-sized `.fif`/`.eeg` file copies for each segment.
-- All pipeline steps access the continuous raw BrainVision recording via **memory-mapped lazy slicing**, writing only lightweight JSON/TXT metadata and a single final cleaned `.set` file to disk.
+- All pipeline steps access data via **memory-mapped lazy slicing** or MNE-Python FIF files, writing only lightweight JSON/TXT metadata and final cleaned datasets to disk.
 
 ### 4. **Volume-Wise Kronecker Template Averaging**
 - The averaging matrix is constructed strictly according to MRI acquisition geometry via the Kronecker product: **W = kron(W_vol, I_slices)**.
 - Slice #1 is averaged only with Slice #1 from neighboring volumes (TR = 2.5 s), ensuring alpha oscillations (10 Hz = 100 ms period) never contaminate the subtraction template.
 
-### 5. **Per-Trial Artifact Persistence**
-- Each Optuna trial creates its own subdirectory (`segment4/trial0/`, `trial1/`, …) containing:
-  - `params.json` — hyperparameters (shift, win_k, motion_thresh)
-  - `metrics.json` — computed loss, gradient suppression, alpha retention, etc.
-  - `spectrum.png` — PSD comparison plot (raw vs. clean, 0–70 Hz) with harmonic markers
-  - `clean_1ch.mat` — cleaned single-channel signal for inspection
-  - `bergen_clean.m` — executed MATLAB script for reproducibility
-- Enables side-by-side visual comparison of trials and full audit trail of the optimization process.
+### 5. **Optuna TPE Bayesian Optimization**
+- **Bergen AAS**: optimizes `shift`, `win_k`, `motion_thresh`
+- **BCG removal**: optimizes `pre_filt`, `l_freq`, `h_freq`, `corr_thresh`
+- **ICA preprocessing**: optimizes all `clean_rawdata` parameters (FlatlineCriterion, ChannelCriterion, LineNoiseCriterion, BurstCriterion, WindowCriterion) + ICLabel rejection threshold
+- Each optimization uses 20+ trials with persistent SQLite storage and MedianPruner for early stopping.
 
 ---
 
@@ -40,16 +67,20 @@ This pipeline combines the vectorized Bergen Average Artifact Subtraction (AAS) 
 ```
 EEG_FMRI_CLEAN/
 ├── config.py                      # Centralized configuration: paths, frequencies, bands
-├── run_all.py                     # End-to-end master runner
+├── run_all.py                     # End-to-end master runner (steps 01-11)
 ├── bergen_fast_correction.m       # Vectorized high-speed Bergen AAS kernel (MATLAB)
 │
 ├── step01_detect_mri.py           # Step 01: Auto-detect MRI session temporal windows
 ├── step02_detect_slices.py        # Step 02: Sub-sample slice gradient phase detection
 ├── step03_trim_dummy.py           # Step 03: Trim dummy scans, align with SPM rp_*.txt
-├── step04_optuna_tune.py          # Step 04: Bayesian optimization (Optuna TPE)
+├── step04_optuna_tune.py          # Step 04: Bayesian optimization (Bergen AAS)
 ├── step05_bergen_clean.py         # Step 05: Full multi-channel Bergen AAS cleaning
 ├── step06_spectra_analysis.py     # Step 06: Welch PSD, quality metrics, EEG21 comparison
-├── step07_html_report.py          # Step 07: Self-contained interactive HTML report
+├── step07_html_report.py          # Step 07: Self-contained interactive HTML report (Bergen)
+├── step08_bcg_optuna.py           # Step 08: Bayesian optimization (BCG removal)
+├── step09_ica.py                  # Step 09: Apply BCG removal with optimized parameters
+├── step10_optuna_ica.py           # Step 10: Bayesian optimization (ICA + clean_rawdata)
+├── step11_ica_final.py            # Step 11: Apply ICA with optimized parameters
 │
 ├── EEG_files/                     # Continuous raw EEG recordings
 │   └── 1916/
@@ -57,18 +88,18 @@ EEG_FMRI_CLEAN/
 │       ├── 1916_inside.vmrk
 │       └── 1916_inside.eeg
 │
+├── data/                          # Output directory (MNE-BIDS-like structure)
+│   └── 1916/
+│       └── derivatives/
+│           ├── 01_bergen/         # Bergen-cleaned .set files
+│           ├── 02_downsampled/    # Downsampled to 250 Hz .fif files
+│           ├── 03_bcg/            # BCG-cleaned .fif files
+│           ├── 04_interpolated/   # Bad channel interpolation .fif files
+│           └── 05_ica/            # ICA-cleaned .fif files + reports
+│
 └── 1916/                          # Subject directory
     └── segments/
         └── segment4/              # Working directory for target segment
-            ├── trial0/            # Optuna trial 0 artifacts
-            │   ├── params.json
-            │   ├── metrics.json
-            │   ├── spectrum.png
-            │   ├── clean_1ch.mat
-            │   └── bergen_clean.m
-            ├── trial1/            # Optuna trial 1 artifacts
-            │   └── ...
-            ├── ...
             ├── add/
             │   ├── rp/            # SPM head motion parameters (rp_*.txt)
             │   └── eeg21/         # Reference 21-channel EEG outside MRI (.edf + .blocks)
@@ -76,8 +107,19 @@ EEG_FMRI_CLEAN/
             ├── slice_detection.json       # Detected slice phase (best_phase)
             ├── segment_work_info.json     # Synchronized working interval boundaries
             ├── slice_triggers.txt         # Slice trigger indices for MATLAB (1-based)
-            ├── optuna_best_params.json    # Winning hyperparameters from Optuna
-            ├── optuna_study.db            # SQLite database of all trials (persistent)
+            ├── optuna_best_params.json    # Winning hyperparameters (Bergen)
+            ├── optuna_study.db            # SQLite database of all Bergen trials
+            ├── bcg_optuna_best.json       # Winning hyperparameters (BCG)
+            ├── bcg_optuna_study.db        # SQLite database of all BCG trials
+            ├── ica_optuna_best.json       # Winning hyperparameters (ICA)
+            ├── ica_optuna_study.db        # SQLite database of all ICA trials
+            ├── summary_alpha_quality.csv  # Quality metrics summary table
+            ├── metrics.csv                # Metrics table for downstream analysis
+            ├── alpha_quality_check.png    # Alpha rhythm control panel (5–20 Hz)
+            ├── step03_spectra.png         # Full spectral overview (0.5–40 Hz)
+            ├── segment4_bergen_*.set      # Cleaned full multi-channel EEGLAB dataset
+            └── segment4_cleaning_report.html # Bergen HTML report
+```
             ├── summary_alpha_quality.csv  # Quality metrics summary table
             ├── metrics.csv                # Metrics table for downstream analysis
             ├── alpha_quality_check.png    # Alpha rhythm control panel (5–20 Hz)
@@ -104,8 +146,8 @@ EEG_FMRI_CLEAN/
            (+ SPM rp_*.txt)
                               │
                               ▼
-  [STEP 04] step04_optuna_tune.py     ──► trial0..N/, optuna_best_params.json, optuna_result.png
-           (1-channel Oz, G_supp + Alpha retention)
+  [STEP 04] step04_optuna_tune.py     ──► optuna_best_params.json, optuna_result.png
+           (Bergen AAS: 1-channel Oz, optimize shift/win_k/motion_thresh)
                               │
                               ▼
   [STEP 05] step05_bergen_clean.py    ──► segmentX_bergen_optuna_*.set (96 channels)
@@ -116,7 +158,26 @@ EEG_FMRI_CLEAN/
            (Comparison with EEG21 reference)
                               │
                               ▼
-  [STEP 07] step07_html_report.py     ──► segmentX_cleaning_report.html
+  [STEP 07] step07_html_report.py     ──► segmentX_cleaning_report.html (Bergen report)
+                              │
+                              ▼
+  [STEP 08] step08_bcg_optuna.py      ──► bcg_optuna_best.json, bcg_optuna_result.png
+           (BCG removal: optimize pre_filt/l_freq/h_freq/corr_thresh)
+                              │
+                              ▼
+  [STEP 09] step09_ica.py             ──► data/.../03_bcg/segmentX_bcg_clean.fif
+           (Apply BCG removal with optimized parameters)
+                              │
+                              ▼
+  [STEP 10] step10_optuna_ica.py      ──► ica_optuna_best.json, ica_optuna_result.png
+           (ICA: optimize clean_rawdata params + ICLabel threshold, 60s subset)
+                              │
+                              ▼
+  [STEP 11] step11_ica_final.py       ──► data/.../05_ica/segmentX_ica_clean.fif
+           (Apply ICA with optimized parameters to full data)
+                              │
+                              ▼
+                    FINAL CLEAN EEG DATA
 ```
 
 ### Step 01: MRI Session Detection (`step01_detect_mri.py`)
@@ -185,6 +246,39 @@ EEG_FMRI_CLEAN/
 - Generates a fully self-contained HTML document `segmentX_cleaning_report.html` with all plots embedded as Base64.
 - Includes a quality metrics summary table per channel, validation status (`EXCELLENT / PASS / REVIEW`), Optuna optimization progress, slice phase detection plot, and full spectral comparisons.
 
+### Step 08: BCG Artifact Removal Optimization (`step08_bcg_optuna.py`)
+- Downsamples Bergen-cleaned data to 250 Hz and optimizes BCG removal parameters via Optuna TPE:
+  - `pre_filt`: bandpass filter before peak detection (0.5–40 Hz range)
+  - `l_freq`, `h_freq`: final bandpass filter after BCG removal
+  - `corr_thresh`: correlation threshold for BCG template rejection (0.5–0.95)
+- **Loss function**: balances BCG suppression (1–5 Hz power reduction) with alpha retention (8–13 Hz preservation).
+- Saves winning parameters to `bcg_optuna_best.json` and trial history to `bcg_optuna_study.db`.
+
+### Step 09: Apply BCG Removal (`step09_ica.py`)
+- Applies optimized BCG removal to all channels using MNE's `mne.preprocessing.find_ecg_events` and template subtraction.
+- Saves cleaned data to `data/.../03_bcg/segmentX_bcg_clean.fif`.
+
+### Step 10: ICA Parameter Optimization (`step10_optuna_ica.py`)
+- Uses first 60 seconds of BCG-cleaned data (for speed) to optimize:
+  - **clean_rawdata parameters**: FlatlineCriterion, ChannelCriterion, LineNoiseCriterion, BurstCriterion, WindowCriterion
+  - **ICLabel rejection threshold**: 0.60–0.90 for artifact component removal
+- Runs full ICA decomposition (runica) per trial, classifies components with ICLabel, and computes:
+  - `alpha_retention`: how much alpha power (8–13 Hz) survived ICA (target ≥ 85%)
+  - `variance_drop`: fraction of total variance removed (target ≤ 15%)
+  - `n_ch_removed`: number of bad channels removed by clean_rawdata
+- **Loss function**:
+  ```
+  Loss = 100 × (0.85 - alpha_retention)² + 50 × max(0, variance_drop - 0.15)² + 200 × (n_ch_removed / 95)²
+  ```
+- Saves winning parameters to `ica_optuna_best.json` and trial history to `ica_optuna_study.db`.
+
+### Step 11: Apply Optimized ICA to Full Data (`step11_ica_final.py`)
+- Applies optimized `clean_rawdata` parameters to full BCG-cleaned data.
+- Interpolates bad channels, re-references to average.
+- Fits ICA (Extended Infomax), classifies components with ICLabel, removes artifact components above threshold.
+- Saves final cleaned data to `data/.../05_ica/segmentX_ica_clean.fif`.
+- Generates HTML report with component topographies and spectral plots.
+
 ---
 
 ## 📊 Example Quality Metrics Table (`summary_alpha_quality.csv`)
@@ -235,43 +329,51 @@ EVAL_CHANNELS = ["O1", "Oz", "O2", "Pz", "P3", "P4", "Fz", "Cz"]
 
 ## 🚀 Running the Pipeline
 
-### 1. End-to-End Execution (All Steps):
+### 1. End-to-End Execution (All Steps 01-11):
 ```bash
-# Run for default segment (segment4):
+# Full pipeline (Bergen + BCG + ICA) for default segment:
 python run_all.py
 
-# Run for arbitrary segment with custom Optuna trial count:
+# Custom segment with more Optuna trials:
 python run_all.py --segment-dir 1916/segments/segment4 --trials 30
 
 # Skip MRI session detection (if sessions already determined):
-python run_all.py --segment-dir 1916/segments/segment4 --skip-detect-mri
+python run_all.py --skip-detect-mri
 
-# Fast cleaning with already-saved Optuna hyperparameters (no re-optimization):
-python run_all.py --segment-dir 1916/segments/segment4 --skip-optuna
+# Skip Bergen optimization (use existing params):
+python run_all.py --skip-optuna
+
+# Skip BCG removal entirely (steps 08-09):
+python run_all.py --skip-bcg
+
+# Skip ICA optimization (use existing params, but still run ICA):
+python run_all.py --skip-ica-optuna
+
+# Skip ICA entirely (steps 10-11):
+python run_all.py --skip-ica
+
+# Bergen only (no BCG, no ICA):
+python run_all.py --skip-bcg --skip-ica
 ```
 
 ### 2. Step-by-Step Execution (Individual Stages):
 ```bash
-# Step 01: Detect MRI sessions in continuous recording
-python step01_detect_mri.py
+# Steps 01-07: Bergen gradient artifact removal
+python step01_detect_mri.py          # Detect MRI sessions
+python step02_detect_slices.py       # Sub-sample slice phase detection
+python step03_trim_dummy.py          # Trim dummy scans, align with SPM rp_*.txt
+python step04_optuna_tune.py         # Hyperparameter tuning (Bergen AAS)
+python step05_bergen_clean.py        # Full multi-channel Bergen cleaning
+python step06_spectra_analysis.py    # Compute spectra & quality metrics
+python step07_html_report.py         # Generate HTML report
 
-# Step 02: Sub-sample slice phase detection
-python step02_detect_slices.py
+# Steps 08-09: BCG artifact removal
+python step08_bcg_optuna.py          # Optimize BCG parameters
+python step09_ica.py                 # Apply BCG removal
 
-# Step 03: Trim dummy scans and align with SPM rp_*.txt
-python step03_trim_dummy.py
-
-# Step 04: Hyperparameter tuning via Optuna TPE on Oz
-python step04_optuna_tune.py
-
-# Step 05: Full multi-channel Bergen AAS cleaning (96 channels)
-python step05_bergen_clean.py
-
-# Step 06: Compute spectra, quality metrics, and EEG21 comparison
-python step06_spectra_analysis.py
-
-# Step 07: Assemble final HTML report
-python step07_html_report.py
+# Steps 10-11: ICA cleaning
+python step10_optuna_ica.py          # Optimize ICA + clean_rawdata parameters
+python step11_ica_final.py           # Apply ICA to full data
 ```
 
 ---
