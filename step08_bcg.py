@@ -59,7 +59,7 @@ FMRIB_DIR    = EEGLAB_DIR / "plugins" / "fMRIb2.1"
 # at 100 Hz sits well below the 125 Hz Nyquist of the 250 Hz data, leaving a
 # ~25 Hz transition margin, so 1-100 Hz is clean. 100 Hz keeps low/mid gamma.
 FILTER_HP = 1.0               # Hz high-pass
-FILTER_LP = 100.0             # Hz low-pass
+FILTER_LP = 45.0              # Hz low-pass (cuts MRI helium-pump vibration comb 44-100 Hz)
 
 # npc SELECTION POLICY (OBS -> ICA architecture):
 # BCG is NOT required to be surgically alpha-preserving here. Its job is to
@@ -69,6 +69,9 @@ FILTER_LP = 100.0             # Hz low-pass
 # only (it cannot cleanly distinguish "ate the rhythm" from "removed BCG power
 # that overlapped the 8-13 Hz band"), and is used just to warn, not to gate.
 ALPHA_WARN_MIN = 0.60   # below this, flag REVIEW for a human/QC glance
+ALPHA_GATE_MIN = 0.75   # npc selection: pick strongest cardiac suppression
+                        # among npc whose alpha retention stays >= this gate.
+                        # BCG is deliberately conservative; ICA cleans the rest.
 
 # Channels used to SCORE each npc. Must be the SAME set used for the final
 # metric, otherwise the sweep is biased. Frontal channels have the strongest
@@ -324,13 +327,17 @@ def plot_spectra(before, after, sfreq, ch_names, eval_chs, out_png: Path):
         ax = axes[k // ncol][k % ncol]
         f, pb = welch(before[i], sfreq, nperseg=nperseg)
         _, pa = welch(after[i],  sfreq, nperseg=nperseg)
-        m = f <= min(FILTER_LP + 5, sfreq / 2)
+        # Plot up to 100 Hz (or Nyquist) so the low-pass roll-off at FILTER_LP
+        # is visible as QC: the helium-pump comb above 45 Hz should be gone.
+        fmax_plot = min(100.0, sfreq / 2)
+        m = f <= fmax_plot
         ax.semilogy(f[m], pb[m], color="#e17055", lw=0.9, label="Before BCG")
         ax.semilogy(f[m], pa[m], color="#00b894", lw=1.1, label="After BCG")
+        ax.axvline(FILTER_LP, color="gray", ls="--", alpha=0.5, lw=0.8)
         ax.axvspan(*CARDIAC_BAND, color="#d63031", alpha=0.08)
         ax.axvspan(*ALPHA_BAND, color="#0984e3", alpha=0.08)
         ax.set_title(name, fontsize=9, fontweight="bold")
-        ax.set_xlim(0, min(FILTER_LP + 5, sfreq / 2)); ax.grid(True, alpha=0.3, which="both")
+        ax.set_xlim(0, fmax_plot); ax.grid(True, alpha=0.3, which="both")
         if k == 0:
             ax.legend(fontsize=7, loc="upper right")
     for k in range(n, nrow * ncol):
@@ -476,6 +483,12 @@ def run_bcg_pipeline(segment_dir: Path = DEFAULT_SEGMENT_DIR, npc_grid=None):
     #    its subtraction across 0.7-15 Hz (eating alpha) and the metric is noisy.
     raw_rs = resample_raw(raw, TARGET_SFREQ)
     del raw; gc.collect()
+    # Band-pass EEG to FILTER_LP (45 Hz). The low-pass removes the MRI helium-pump
+    # vibration comb (a 1-Hz-spaced harmonic comb spanning 44-100 Hz that Bergen
+    # AAS leaves untouched because it is not gradient-locked). ZapLine was tried
+    # and rejected: it only targets a single mains line (50 Hz) and removed <5%
+    # of this broadband comb. Gamma (>45 Hz) is sacrificed but is buried in the
+    # artifact anyway.
     raw_rs = bandpass_raw(raw_rs, FILTER_HP, FILTER_LP)
     resamp_fif = resamp_dir / f"{seg_name}_250hz.fif"
     raw_rs.save(resamp_fif, overwrite=True, verbose=False)
@@ -518,10 +531,19 @@ def run_bcg_pipeline(segment_dir: Path = DEFAULT_SEGMENT_DIR, npc_grid=None):
               f"cardiac={m['cardiac_suppression']*100:.1f}% alpha={m['alpha_retention']*100:.1f}%")
         del clean_all, after_eeg; gc.collect()
 
-    # Selection: strongest cardiac suppression (OBS -> ICA architecture). Alpha
-    # retention is reported only, and used to raise a soft REVIEW flag when it
-    # drops low enough that a human/QC glance is worth it before ICA.
-    best_npc = max(sweep, key=lambda n: sweep[n]["cardiac_suppression"])
+    # Selection (OBS -> ICA architecture): strongest cardiac suppression AMONG
+    # the npc that keep alpha retention >= ALPHA_GATE_MIN. Previously this took
+    # the raw max cardiac suppression, which always picked the most aggressive
+    # npc and halved the alpha rhythm (e.g. npc=8: cardiac 82%, alpha 53%). BCG
+    # is meant to be conservative; residual BCG is left for ICA to remove.
+    eligible = [n for n in sweep if sweep[n]["alpha_retention"] >= ALPHA_GATE_MIN]
+    if eligible:
+        best_npc = max(eligible, key=lambda n: sweep[n]["cardiac_suppression"])
+    else:
+        # No npc preserves enough alpha -> fall back to the least destructive one.
+        best_npc = max(sweep, key=lambda n: sweep[n]["alpha_retention"])
+        print(f"  [WARN] No npc keeps alpha >= {ALPHA_GATE_MIN*100:.0f}%; "
+              f"falling back to max-alpha npc={best_npc}.")
     alpha_flag = "OK" if sweep[best_npc]["alpha_retention"] >= ALPHA_WARN_MIN else "REVIEW"
     if alpha_flag == "REVIEW":
         print(f"  [NOTE] alpha retention {sweep[best_npc]['alpha_retention']*100:.1f}% "

@@ -28,7 +28,7 @@ except ImportError:
     from config import (DEFAULT_SEGMENT_DIR, EVAL_CHANNELS, ALPHA_BAND,
                          BG_BANDS, GRADIENT_HARMONICS)
 
-FMAX_COMPARE = 40.0
+FMAX_COMPARE = 100.0
 NPERSEG_SEC = 4
 
 
@@ -320,7 +320,7 @@ def plot_spectra_comparison(data_dict: dict, eeg21_available: bool, segment_dir:
     plot_chs = ["Fz", "Cz", "Pz", "Oz", "O1", "O2"]
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     fig.suptitle(
-        f"Power Spectral Density (PSD 0.5 - 40 Hz) - {segment_dir.name}\n"
+        f"Power Spectral Density (PSD 0.5 - 100 Hz) - {segment_dir.name}\n"
         "Comparison: Raw (inside MRI) vs Bergen AAS Cleaned (Optuna Winner)"
         + (" vs EEG21 Outside MRI" if eeg21_available else ""),
         fontsize=13, fontweight="bold"
@@ -348,13 +348,13 @@ def plot_spectra_comparison(data_dict: dict, eeg21_available: bool, segment_dir:
                 m_e = (f_e >= 0.5) & (f_e <= FMAX_COMPARE)
                 ax.semilogy(f_e[m_e], psd_e[m_e], color="#6c5ce7", lw=1.4, ls="--", label="EEG21 (outside MRI)")
 
-        for h in [10, 20, 30, 40]:
+        for h in [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]:
             ax.axvline(h, color="gray", ls=":", alpha=0.4)
 
         ax.set_title(f"Channel: {ch}", fontweight="bold", fontsize=11)
         ax.set_xlabel("Frequency (Hz)")
         ax.set_ylabel("Power (uV^2/Hz)")
-        ax.set_xlim(0.5, 40)
+        ax.set_xlim(0.5, 100)
         ax.legend(fontsize=8, loc="upper right")
         ax.grid(True, which="both", ls="--", alpha=0.3)
 

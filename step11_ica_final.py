@@ -62,6 +62,18 @@ def apply_optimized_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR):
             "iclabel_thresh": 0.80  # Conservative: only clear artifacts rejected
         }
 
+    # SAFETY GUARD: clamp Optuna params to prevent over-cleaning.
+    # A threshold below 0.65 rejects "probably brain" ICs (P(brain)~0.4) and
+    # destroys the signal (previously 0.6 -> 69% of ICs rejected, 77% var drop).
+    thr_raw = float(best.get("iclabel_thresh", 0.80))
+    if thr_raw < 0.65:
+        print(f"    [GUARD] iclabel_thresh={thr_raw} is unsafe (< 0.65), clamping to 0.80")
+        best["iclabel_thresh"] = 0.80
+    ch_raw = float(best.get("channel_crit", 0.85))
+    if ch_raw < 0.70:
+        print(f"    [GUARD] channel_crit={ch_raw} is unsafe (< 0.70), clamping to 0.80")
+        best["channel_crit"] = 0.80
+
     for k, v in best.items():
         print(f"    {k:25s} = {v}")
 
@@ -179,11 +191,13 @@ fprintf('Running ICLabel classification...\\n');
 EEG_clean = pop_iclabel(EEG_clean, 'default');
 ic_classes = EEG_clean.etc.ic_classification.ICLabel.classifications;
 
-% Auto-reject artifacts:
-% Reject if dominant class is artifact (Muscle=2, Eye=3, Heart=4, Line=5, Chan=6)
-% AND probability >= threshold
-% Also reject if Brain probability < 0.20 (almost certainly not brain)
-% Also reject "Other" (col 7) if probability >= 0.90
+% Balanced rejection rule for EEG-fMRI (matches step10 Phase-3 sweep):
+% (1) dominant class is a confident artifact (Muscle=2,Eye=3,Heart=4,Line=5,Chan=6)
+%     AND probability >= threshold, OR
+% (2) "Other" (col 7) with brain probability < 0.02 (residual fMRI noise that
+%     ICLabel can't name, but is 98% sure is NOT brain).
+% We do NOT reject on brain_prob<0.20 or Other>=0.90 -- on EEG-fMRI those fire
+% on nearly every component and destroy the alpha rhythm (a_ret 0.93 -> 0.14).
 artifact_cols = [2, 3, 4, 5, 6];
 rej_mask = false(1, n_ic);
 for c = 1:n_ic
@@ -191,18 +205,13 @@ for c = 1:n_ic
     [max_prob, dominant] = max(probs);
     brain_prob = probs(1);
 
-    % Reject if dominant is artifact type and above threshold
+    % Rule 1: confident artifact above threshold
     if any(dominant == artifact_cols) && max_prob >= {iclabel_thresh}
         rej_mask(c) = true;
     end
 
-    % Reject if Brain probability is very low (regardless of dominant class)
-    if brain_prob < 0.20
-        rej_mask(c) = true;
-    end
-
-    % Reject "Other" (column 7) if very high probability
-    if dominant == 7 && max_prob >= 0.90
+    % Rule 2: "Other" (column 7) with near-zero brain probability
+    if dominant == 7 && brain_prob < 0.02
         rej_mask(c) = true;
     end
 end

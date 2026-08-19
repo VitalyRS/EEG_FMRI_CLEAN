@@ -5,7 +5,7 @@ Generates a complete standalone HTML report with:
   - Dataset overview and sequence parameters
   - Optuna Bayesian Optimization summary & winner hyperparameters
   - Quantitative Alpha-Preservation & Gradient Suppression Quality Dashboard
-  - Embedded full spectra plots (0.5 - 40 Hz) and zoomed Alpha Dashboard (5 - 20 Hz)
+  - Embedded full spectra plots (0.5 - 100 Hz) and zoomed Alpha Dashboard (5 - 20 Hz)
   - Comparison with outside-MRI EEG21 biological reference (including EO/EC reactivity)
 """
 from pathlib import Path
@@ -274,7 +274,7 @@ def generate_html_report(segment_dir: Path = DEFAULT_SEGMENT_DIR):
     </div>
 
     <div class="card">
-        <h2>📊 Полный спектральный анализ (0.5 - 40 Гц)</h2>
+        <h2>📊 Полный спектральный анализ (0.5 - 100 Гц)</h2>
         <p>Сопоставление: <strong>Сырой ЭЭГ внутри МРТ (красный)</strong> vs <strong>Очищенный Bergen AAS (зеленый)</strong> vs <strong>Эталон EEG21 вне МРТ (фиолетовый пунктир)</strong>:</p>
         <img src="data:image/png;base64,{b64_spectra}" alt="Full Spectra Comparison"/>
     </div>
