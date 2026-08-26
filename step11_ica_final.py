@@ -28,7 +28,8 @@ STD_1005 = DIPFIT_DIR / "standard_BEM" / "elec" / "standard_1005.elc"
 
 def _find_bcg_fif(segment_dir: Path) -> Path:
     seg = segment_dir.name
-    p = DATA_ROOT / DEFAULT_EXPERIMENT / "derivatives" / "03_bcg" / seg / f"{seg}_bcg_clean.fif"
+    subject_id = segment_dir.parent.parent.name if segment_dir.parent.name == "segments" else segment_dir.parent.name
+    p = DATA_ROOT / subject_id / "derivatives" / "03_bcg" / seg / f"{seg}_bcg_clean.fif"
     if not p.exists():
         raise FileNotFoundError(f"BCG input not found: {p}. Run step08 first.")
     return p
@@ -37,8 +38,9 @@ def _find_bcg_fif(segment_dir: Path) -> Path:
 def apply_optimized_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR):
     segment_dir = Path(segment_dir).resolve()
     seg = segment_dir.name
+    subject_id = segment_dir.parent.parent.name if segment_dir.parent.name == "segments" else segment_dir.parent.name
     print("=" * 80)
-    print(f"[STEP 11] Applying Optimized ICA Parameters to Full Dataset: {seg}")
+    print(f"[STEP 11] Applying Optimized ICA Parameters to Full Dataset: {subject_id}/{seg}")
     print("=" * 80)
 
     # Load best params from step10 with fallback to standard robust defaults
@@ -321,7 +323,7 @@ exit(0);
     print(f"  ICs rejected:     {n_ic_rejected} / {n_ic}")
 
     # Save final cleaned data as FIF
-    out_deriv_dir = DATA_ROOT / DEFAULT_EXPERIMENT / "derivatives" / "05_ica" / seg
+    out_deriv_dir = DATA_ROOT / subject_id / "derivatives" / "05_ica" / seg
     out_deriv_dir.mkdir(parents=True, exist_ok=True)
     out_fif = out_deriv_dir / f"{seg}_ica_clean.fif"
 
@@ -338,7 +340,7 @@ exit(0);
         json.dump(metrics, f, indent=2)
 
     # Save removed channels list
-    ch_deriv_dir = DATA_ROOT / DEFAULT_EXPERIMENT / "derivatives" / "04_channels" / seg
+    ch_deriv_dir = DATA_ROOT / subject_id / "derivatives" / "04_channels" / seg
     ch_deriv_dir.mkdir(parents=True, exist_ok=True)
     removed_json = ch_deriv_dir / "removed_channels.json"
     with open(removed_json, "w") as f:
@@ -347,7 +349,7 @@ exit(0);
     # Generate QC plots and HTML report
     print("\n  Generating QC plots & report...")
     generate_ica_report(data, after_data, ch_names, sfreq, ic_classes,
-                        reject_ic_list, removed_chans_list, metrics, seg)
+                        reject_ic_list, removed_chans_list, metrics, seg, subject_id)
 
     print("\n" + "=" * 80)
     print(f"[STEP 11] ICA Complete! Output: {out_fif.name}")
@@ -356,9 +358,9 @@ exit(0);
 
 
 def generate_ica_report(data_before, data_after, ch_names, sfreq, ic_classes,
-                        reject_ic_list, removed_chans, metrics, seg):
+                        reject_ic_list, removed_chans, metrics, seg, subject_id: str = DEFAULT_EXPERIMENT):
     """Generate HTML report with PSD, ICLabel, and channel plots."""
-    qc_dir = PROJECT_ROOT / "qc" / DEFAULT_EXPERIMENT / "ica"
+    qc_dir = PROJECT_ROOT / "qc" / subject_id / "ica"
     qc_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. PSD comparison for eval channels
@@ -474,7 +476,7 @@ img {{max-width:100%;height:auto;border-radius:4px;}}
 <div class="card"><h2>Removed Channels</h2><img src="data:image/png;base64,{b64_channels}"></div>
 </body></html>"""
 
-    out_deriv_dir = DATA_ROOT / DEFAULT_EXPERIMENT / "derivatives" / "05_ica" / seg
+    out_deriv_dir = DATA_ROOT / subject_id / "derivatives" / "05_ica" / seg
     report_html = out_deriv_dir / f"{seg}_ica_report.html"
     with open(report_html, "w", encoding="utf-8") as f:
         f.write(html)
@@ -483,7 +485,34 @@ img {{max-width:100%;height:auto;border-radius:4px;}}
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Apply optimized ICA to full dataset")
-    parser.add_argument("--segment-dir", type=Path, default=DEFAULT_SEGMENT_DIR)
+    parser = argparse.ArgumentParser(description="STEP 11: Apply optimized ICA to full dataset")
+    parser.add_argument("--subject", default=None, help="Subject ID (e.g. 1916)")
+    parser.add_argument("--segment", default=None, help="Segment name (e.g. ec, drone) or omit for all segments of subject")
+    parser.add_argument("--all", action="store_true", help="Process all available subjects and segments")
     args = parser.parse_args()
-    apply_optimized_ica(args.segment_dir)
+
+    seg_dirs: list[Path] = []
+    if args.subject:
+        subj_seg_dir = DATA_ROOT / args.subject / "segments"
+        if args.segment:
+            target = subj_seg_dir / args.segment
+            if target.exists():
+                seg_dirs.append(target)
+            else:
+                print(f"[ERROR] Segment folder not found: {target}")
+        else:
+            if subj_seg_dir.exists():
+                seg_dirs.extend(sorted(p for p in subj_seg_dir.iterdir() if p.is_dir() and (p / "segment_work_info.json").exists()))
+            else:
+                print(f"[ERROR] No segments directory found for subject {args.subject}: {subj_seg_dir}")
+    elif args.all or (not args.subject and not args.segment):
+        for subj_dir in sorted(DATA_ROOT.glob("*")):
+            subj_seg_dir = subj_dir / "segments"
+            if subj_seg_dir.exists():
+                seg_dirs.extend(sorted(p for p in subj_seg_dir.iterdir() if p.is_dir() and (p / "segment_work_info.json").exists()))
+
+    if not seg_dirs:
+        print("[ERROR] No segments found with segment_work_info.json. Run previous steps first!")
+    else:
+        for sdir in seg_dirs:
+            apply_optimized_ica(sdir)

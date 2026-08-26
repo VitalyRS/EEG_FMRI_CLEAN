@@ -257,7 +257,7 @@ def run_optuna_tuning(segment_dir: Path = DEFAULT_SEGMENT_DIR,
     t_start = float(work_info["t_work_start_sec"])
     t_stop  = float(work_info["t_work_stop_sec"])
     slices_per_volume = int(work_info.get("slices_per_volume", 25))
-    rp_file_str = work_info.get("rp_file")
+    rp_file_str = work_info.get("rp_file") or work_info.get("rp_path")
     rp_path = Path(rp_file_str).resolve() if rp_file_str else None
     triggers_path = segment_dir / "slice_triggers.txt"
 
@@ -424,4 +424,41 @@ def plot_optuna_summary(study: optuna.Study, segment_dir: Path):
 
 
 if __name__ == "__main__":
-    run_optuna_tuning()
+    import argparse
+    try:
+        from .config import DATA_ROOT, DEFAULT_N_TRIALS
+    except ImportError:
+        from config import DATA_ROOT, DEFAULT_N_TRIALS
+
+    parser = argparse.ArgumentParser(description="STEP 04: Fast Optuna hyperparameter optimization for Bergen")
+    parser.add_argument("--subject", default=None, help="Subject ID (e.g. 1916)")
+    parser.add_argument("--segment", default=None, help="Segment name (e.g. ec, drone) or omit for all segments of subject")
+    parser.add_argument("--n-trials", type=int, default=DEFAULT_N_TRIALS, help=f"Number of Optuna trials (default: {DEFAULT_N_TRIALS})")
+    parser.add_argument("--all", action="store_true", help="Process all available subjects and segments")
+    args = parser.parse_args()
+
+    seg_dirs: list[Path] = []
+    if args.subject:
+        subj_seg_dir = DATA_ROOT / args.subject / "segments"
+        if args.segment:
+            target = subj_seg_dir / args.segment
+            if target.exists():
+                seg_dirs.append(target)
+            else:
+                print(f"[ERROR] Segment folder not found: {target}")
+        else:
+            if subj_seg_dir.exists():
+                seg_dirs.extend(sorted(p for p in subj_seg_dir.iterdir() if p.is_dir() and (p / "segment_work_info.json").exists()))
+            else:
+                print(f"[ERROR] No segments directory found for subject {args.subject}: {subj_seg_dir}")
+    elif args.all or (not args.subject and not args.segment):
+        for subj_dir in sorted(DATA_ROOT.glob("*")):
+            subj_seg_dir = subj_dir / "segments"
+            if subj_seg_dir.exists():
+                seg_dirs.extend(sorted(p for p in subj_seg_dir.iterdir() if p.is_dir() and (p / "segment_work_info.json").exists()))
+
+    if not seg_dirs:
+        print("[ERROR] No segments found with segment_work_info.json. Run step03_trim_dummy.py first!")
+    else:
+        for sdir in seg_dirs:
+            run_optuna_tuning(segment_dir=sdir, n_trials=args.n_trials)

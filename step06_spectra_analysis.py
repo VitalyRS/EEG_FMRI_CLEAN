@@ -137,11 +137,12 @@ def compute_spectra(segment_dir: Path = DEFAULT_SEGMENT_DIR):
 
     out_dict = {}
 
-    # 1. Compute Raw PSD directly from continuous raw VHDR
+    # 1. Compute Raw PSD directly from continuous raw VHDR (only EVAL_CHANNELS)
     print(f"  Reading raw EEG window [{t_start:.2f}s .. {t_stop:.2f}s] from: {raw_vhdr.name}")
     raw_raw = mne.io.read_raw_brainvision(raw_vhdr, preload=False, verbose=False)
     sfreq_raw = float(raw_raw.info["sfreq"])
-    raw_crop = raw_raw.copy().crop(tmin=t_start, tmax=min(raw_raw.times[-1], t_stop))
+    raw_eval_picks = [ch for ch in raw_raw.ch_names if ch.upper() in [e.upper() for e in EVAL_CHANNELS]]
+    raw_crop = raw_raw.copy().pick(raw_eval_picks).crop(tmin=t_start, tmax=min(raw_raw.times[-1], t_stop))
 
     for ch in EVAL_CHANNELS:
         picks = [c for c in raw_crop.ch_names if c.upper() == ch.upper()]
@@ -152,22 +153,27 @@ def compute_spectra(segment_dir: Path = DEFAULT_SEGMENT_DIR):
         out_dict[f"raw_{ch}_f"] = f
         out_dict[f"raw_{ch}_psd"] = psd
         out_dict[f"raw_{ch}_std"] = float(np.std(data))
-    del raw_raw, raw_crop; gc.collect()
+    del raw_raw, raw_crop
+    gc.collect()
 
-    # 2. Compute Cleaned PSD from EEGLAB .set
+    # 2. Compute Cleaned PSD from EEGLAB .set (only EVAL_CHANNELS)
     print(f"  Loading cleaned EEG: {clean_set.name}")
     clean_raw = mne.io.read_raw_eeglab(clean_set, preload=False, verbose=False)
     sfreq_clean = float(clean_raw.info["sfreq"])
+    clean_eval_picks = [ch for ch in clean_raw.ch_names if ch.upper() in [e.upper() for e in EVAL_CHANNELS]]
+    clean_crop = clean_raw.copy().pick(clean_eval_picks)
+
     for ch in EVAL_CHANNELS:
-        picks = [c for c in clean_raw.ch_names if c.upper() == ch.upper()]
+        picks = [c for c in clean_crop.ch_names if c.upper() == ch.upper()]
         if not picks:
             continue
-        data = clean_raw.get_data(picks=picks[:1], units="uV")[0]
+        data = clean_crop.get_data(picks=picks[:1], units="uV")[0]
         f, psd = psd_for_channel(data, sfreq_clean, NPERSEG_SEC)
         out_dict[f"clean_{ch}_f"] = f
         out_dict[f"clean_{ch}_psd"] = psd
         out_dict[f"clean_{ch}_std"] = float(np.std(data))
-    del clean_raw; gc.collect()
+    del clean_raw, clean_crop
+    gc.collect()
 
     # 3. Process EEG21 Reference (Outside MRI) with EO/EC Reactivity
     eeg21_dirs = [segment_dir / "add" / "eeg21", segment_dir / "eeg21"]
@@ -420,4 +426,40 @@ def plot_alpha_quality_check(data_dict: dict, eeg21_available: bool, segment_dir
 
 
 if __name__ == "__main__":
-    compute_spectra()
+    import argparse
+    try:
+        from .config import DATA_ROOT
+    except ImportError:
+        from config import DATA_ROOT
+
+    parser = argparse.ArgumentParser(description="STEP 06: Spectral analysis & artifact suppression metrics")
+    parser.add_argument("--subject", default=None, help="Subject ID (e.g. 1916)")
+    parser.add_argument("--segment", default=None, help="Segment name (e.g. ec, drone) or omit for all segments of subject")
+    parser.add_argument("--all", action="store_true", help="Process all available subjects and segments")
+    args = parser.parse_args()
+
+    seg_dirs: list[Path] = []
+    if args.subject:
+        subj_seg_dir = DATA_ROOT / args.subject / "segments"
+        if args.segment:
+            target = subj_seg_dir / args.segment
+            if target.exists():
+                seg_dirs.append(target)
+            else:
+                print(f"[ERROR] Segment folder not found: {target}")
+        else:
+            if subj_seg_dir.exists():
+                seg_dirs.extend(sorted(p for p in subj_seg_dir.iterdir() if p.is_dir() and (p / "segment_work_info.json").exists()))
+            else:
+                print(f"[ERROR] No segments directory found for subject {args.subject}: {subj_seg_dir}")
+    elif args.all or (not args.subject and not args.segment):
+        for subj_dir in sorted(DATA_ROOT.glob("*")):
+            subj_seg_dir = subj_dir / "segments"
+            if subj_seg_dir.exists():
+                seg_dirs.extend(sorted(p for p in subj_seg_dir.iterdir() if p.is_dir() and (p / "segment_work_info.json").exists()))
+
+    if not seg_dirs:
+        print("[ERROR] No segments found with segment_work_info.json. Run previous steps first!")
+    else:
+        for sdir in seg_dirs:
+            compute_spectra(segment_dir=sdir)

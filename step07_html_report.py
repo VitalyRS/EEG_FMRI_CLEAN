@@ -295,4 +295,40 @@ def generate_html_report(segment_dir: Path = DEFAULT_SEGMENT_DIR):
 
 
 if __name__ == "__main__":
-    generate_html_report()
+    import argparse
+    try:
+        from .config import DATA_ROOT
+    except ImportError:
+        from config import DATA_ROOT
+
+    parser = argparse.ArgumentParser(description="STEP 07: Generate standalone HTML report")
+    parser.add_argument("--subject", default=None, help="Subject ID (e.g. 1916)")
+    parser.add_argument("--segment", default=None, help="Segment name (e.g. ec, drone) or omit for all segments of subject")
+    parser.add_argument("--all", action="store_true", help="Process all available subjects and segments")
+    args = parser.parse_args()
+
+    seg_dirs: list[Path] = []
+    if args.subject:
+        subj_seg_dir = DATA_ROOT / args.subject / "segments"
+        if args.segment:
+            target = subj_seg_dir / args.segment
+            if target.exists():
+                seg_dirs.append(target)
+            else:
+                print(f"[ERROR] Segment folder not found: {target}")
+        else:
+            if subj_seg_dir.exists():
+                seg_dirs.extend(sorted(p for p in subj_seg_dir.iterdir() if p.is_dir() and (p / "segment_work_info.json").exists()))
+            else:
+                print(f"[ERROR] No segments directory found for subject {args.subject}: {subj_seg_dir}")
+    elif args.all or (not args.subject and not args.segment):
+        for subj_dir in sorted(DATA_ROOT.glob("*")):
+            subj_seg_dir = subj_dir / "segments"
+            if subj_seg_dir.exists():
+                seg_dirs.extend(sorted(p for p in subj_seg_dir.iterdir() if p.is_dir() and (p / "segment_work_info.json").exists()))
+
+    if not seg_dirs:
+        print("[ERROR] No segments found with segment_work_info.json. Run previous steps first!")
+    else:
+        for sdir in seg_dirs:
+            generate_html_report(segment_dir=sdir)

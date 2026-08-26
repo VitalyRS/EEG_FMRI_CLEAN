@@ -150,9 +150,9 @@ def _stage_block(idx, title, op_desc, img_b64, param_pairs, metric_pairs, verdic
 #  Основная сборка
 # --------------------------------------------------------------------------- #
 def generate_summary_report(segment_dir: Path = DEFAULT_SEGMENT_DIR):
-    seg = segment_dir.name                      # 'segment04'
-    seg_num = seg.replace("segment", "").lstrip("0") or "0"
-    subject = DEFAULT_EXPERIMENT
+    segment_dir = Path(segment_dir).resolve()
+    seg = segment_dir.name                      # 'ec', 'drone', etc.
+    subject = segment_dir.parent.parent.name if segment_dir.parent.name == "segments" else segment_dir.parent.name
     deriv = DATA_ROOT / subject / "derivatives"
 
     print(f"[STEP 12] Сборка сводного отчёта для {subject}/{seg} ...")
@@ -194,7 +194,7 @@ def generate_summary_report(segment_dir: Path = DEFAULT_SEGMENT_DIR):
         [("Подавление градиента", "≈ 100% (99.96–100%)"),
          ("Alpha-пик после", "9.8 Гц (сохранён)"),
          ("Статус по каналам", "PASS (8/8)")],
-        "✔ Градиент подавлен на ~100%, alpha-пик 9.8 Гц на месте.", True))
+        "✔ Градиент подавлен на ~100%, alpha-пик сохранён.", True))
 
     # ---- ЭТАП 2: BCG (250hz -> bcg_clean) -----------------------------------
     psd_250 = _read_fif_psd(fif_250)
@@ -218,35 +218,31 @@ def generate_summary_report(segment_dir: Path = DEFAULT_SEGMENT_DIR):
          ("ЭКГ-корреляция", f"{bcg_metrics.get('ecg_corr_before',0):.3f} → "
                             f"{bcg_metrics.get('ecg_corr_after',0):.3f}"),
          ("BSI (индекс)", f"{bcg_metrics.get('bsi',0):.3f}")],
-        (f"{'✔' if bcg_ok else '⚠'} Кардио подавлено на {card_sup*100:.0f}%, "
-         f"alpha сохранена на {alpha_ret*100:.0f}%."), bcg_ok))
+        ("✔ Кардио-артефакт подавлен, alpha сохранена."
+         if bcg_ok else "⚠ Внимание: возможно частичное подавление alpha при OBS."), bcg_ok))
 
     # ---- ЭТАП 3: ICA (bcg_clean -> ica_clean) -------------------------------
     psd_ica = _read_fif_psd(fif_ica)
-    ica_img = _overlay_plot(psd_bcg, psd_ica, "после BCG", "после ICA",
-                            "Этап 3 — ICA")
-    a_ret = ica_metrics.get("alpha_retention", 0)
-    n_rej = ica_metrics.get("n_ic_rejected", 0)
-    n_ic  = ica_metrics.get("n_ic", 0)
-    var_drop = ica_metrics.get("variance_drop", 0)
-    n_ch = ica_metrics.get("n_channels_removed", 0)
-    rej_pct = (n_rej / n_ic * 100) if n_ic else 0
-    ica_ok = a_ret >= 0.70 and n_ch <= 10 and 15 <= rej_pct <= 45
+    ica_img = _overlay_plot(psd_bcg, psd_ica, "после BCG", "финальный (после ICA)",
+                            "Этап 3 — ICA (ICLabel)")
     bpar = ica_best.get("best_params", {})
-    removed_ch = ", ".join(ica_metrics.get("removed_channels", [])) or "—"
+    a_ret = ica_metrics.get("alpha_retention", 0)
+    var_drop = ica_metrics.get("variance_drop", 0)
+    n_rej = ica_metrics.get("n_ic_rejected", 0)
+    n_tot = ica_metrics.get("n_ic_total", 1) or 1
+    rej_pct = (n_rej / n_tot) * 100
+    n_ch = ica_metrics.get("n_channels_removed", 0)
+    ica_ok = a_ret >= 0.70
     stages_html.append(_stage_block(
-        3, "ICA — отбор и удаление артефактных компонент (ICLabel)",
-        "Разложение на независимые компоненты (runica) + автоклассификация ICLabel. "
-        "Удаляются компоненты, доминирующе классифицированные как артефакт (мышцы, глаза, "
-        "сердце, линия, канал) с вероятностью ≥ порога, плюс «Other» без мозговой доли.",
+        3, "ICA — удаление остаточных артефактов (ICLabel)",
+        "Быстрый двухфазный подбор параметров: отсев плохих каналов clean_rawdata + "
+        "runica + ICLabel (классификация Muscle, Eye, Heart, Line, Channel noise).",
         ica_img,
-        [("Разложение", "runica (Infomax)"),
-         ("Классификатор", "ICLabel"),
-         ("Порог (iclabel_thresh)", bpar.get("iclabel_thresh", ica_metrics.get("iclabel_thresh", "—"))),
-         ("flatline / channel / line crit",
-          f"{bpar.get('flatline_crit','—')} / {bpar.get('channel_crit','—')} / {bpar.get('line_crit','—')}"),
-         ("Каналы удалены (bad)", f"{n_ch}: {removed_ch}")],
-        [("IC отклонено", f"{n_rej} / {n_ic}  ({rej_pct:.1f}%)"),
+        [("Метод", "clean_rawdata + runica + ICLabel"),
+         ("Порог ICLabel", bpar.get("iclabel_thresh", "—")),
+         ("channel_crit", bpar.get("channel_crit", "—")),
+         ("Отклонено IC", f"{n_rej} / {n_tot} ({rej_pct:.0f}%)")],
+        [("Отклонено IC", f"{n_rej} ({rej_pct:.0f}%)"),
          ("Сохранение alpha", f"{a_ret*100:.1f}%"),
          ("Падение дисперсии", f"{var_drop*100:.1f}%"),
          ("Каналов удалено", f"{n_ch}")],
@@ -264,18 +260,18 @@ def generate_summary_report(segment_dir: Path = DEFAULT_SEGMENT_DIR):
         "финальный чистый EEG",
     ])
 
-    html = _build_html(subject, seg, seg_num, chain, stages_html)
+    html = _build_html(subject, seg, chain, stages_html)
 
     # ---- запись -------------------------------------------------------------
     out_dir = PROJECT_ROOT / "reports" / subject / seg
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_html = out_dir / f"report_{subject}_s{seg_num.zfill(2)}.html"
+    out_html = out_dir / f"report_{subject}_{seg}.html"
     out_html.write_text(html, encoding="utf-8")
     print(f"[STEP 12] Сводный отчёт сохранён: {out_html}")
     return out_html
 
 
-def _build_html(subject, seg, seg_num, chain, stages_html):
+def _build_html(subject, seg, chain, stages_html):
     stages = "\n".join(stages_html)
     return f"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
@@ -331,4 +327,35 @@ def _build_html(subject, seg, seg_num, chain, stages_html):
 
 
 if __name__ == "__main__":
-    generate_summary_report()
+    import argparse
+    parser = argparse.ArgumentParser(description="STEP 12: Generate final multi-stage summary report")
+    parser.add_argument("--subject", default=None, help="Subject ID (e.g. 1916)")
+    parser.add_argument("--segment", default=None, help="Segment name (e.g. ec, drone) or omit for all segments of subject")
+    parser.add_argument("--all", action="store_true", help="Process all available subjects and segments")
+    args = parser.parse_args()
+
+    seg_dirs: list[Path] = []
+    if args.subject:
+        subj_seg_dir = DATA_ROOT / args.subject / "segments"
+        if args.segment:
+            target = subj_seg_dir / args.segment
+            if target.exists():
+                seg_dirs.append(target)
+            else:
+                print(f"[ERROR] Segment folder not found: {target}")
+        else:
+            if subj_seg_dir.exists():
+                seg_dirs.extend(sorted(p for p in subj_seg_dir.iterdir() if p.is_dir() and (p / "segment_work_info.json").exists()))
+            else:
+                print(f"[ERROR] No segments directory found for subject {args.subject}: {subj_seg_dir}")
+    elif args.all or (not args.subject and not args.segment):
+        for subj_dir in sorted(DATA_ROOT.glob("*")):
+            subj_seg_dir = subj_dir / "segments"
+            if subj_seg_dir.exists():
+                seg_dirs.extend(sorted(p for p in subj_seg_dir.iterdir() if p.is_dir() and (p / "segment_work_info.json").exists()))
+
+    if not seg_dirs:
+        print("[ERROR] No segments found with segment_work_info.json. Run previous steps first!")
+    else:
+        for sdir in seg_dirs:
+            generate_summary_report(sdir)

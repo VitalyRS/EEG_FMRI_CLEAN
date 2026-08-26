@@ -11,6 +11,16 @@ MATLAB_BIN = Path(os.getenv("MATLAB_BIN", "/home/vitaly/matlab2023/bin/matlab"))
 EEGLAB_DIR = Path(os.getenv("EEGLAB_DIR", "/home/vitaly/Downloads/eeglab_current/eeglab2026.0.0"))
 BERGEN_DIR = Path(os.getenv("BERGEN_DIR", str(EEGLAB_DIR / "plugins" / "BERGEN1.0")))
 
+# External raw dataset paths
+EEG_ORIGINAL_ROOT = Path(os.getenv(
+    "EEG_ORIGINAL_ROOT",
+    "/media/vitaly/48DEA853CCEBFBF0/0DATDA_2026_eeg_fnri/fmri/eeg-fmri/original"
+))
+FMRI_ROOT = Path(os.getenv(
+    "FMRI_ROOT",
+    "/media/vitaly/48DEA853CCEBFBF0/0DATDA_2026_eeg_fnri/fmri/fmri"
+))
+
 # Default subject & segment
 # New "data/<subject>" layout (see README):
 #   data/1916/raw/eeg96/1916.vhdr           -> continuous raw recording

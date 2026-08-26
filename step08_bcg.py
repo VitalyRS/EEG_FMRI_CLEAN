@@ -460,15 +460,16 @@ def generate_bcg_html(seg_name, metrics, best_npc, per_channel, sfreq_before,
 def run_bcg_pipeline(segment_dir: Path = DEFAULT_SEGMENT_DIR, npc_grid=None):
     segment_dir = Path(segment_dir).resolve()
     seg_name = segment_dir.name
+    subject_id = segment_dir.parent.parent.name if segment_dir.parent.name == "segments" else segment_dir.parent.name
     npc_grid = npc_grid or NPC_GRID
     print("=" * 75)
-    print(f"[STEP 08 - BCG] Resample 250 Hz + fMRIB OBS for: {seg_name}")
+    print(f"[STEP 08 - BCG] Resample 250 Hz + fMRIB OBS for: {subject_id}/{seg_name}")
     print("=" * 75)
 
-    subject_deriv = DATA_ROOT / DEFAULT_EXPERIMENT / "derivatives"
+    subject_deriv = DATA_ROOT / subject_id / "derivatives"
     resamp_dir = subject_deriv / "02_resampled250" / seg_name
     bcg_dir    = subject_deriv / "03_bcg" / seg_name
-    qc_dir     = PROJECT_ROOT / "qc" / DEFAULT_EXPERIMENT / "bcg"
+    qc_dir     = PROJECT_ROOT / "qc" / subject_id / "bcg"
     for d in (resamp_dir, bcg_dir, qc_dir):
         d.mkdir(parents=True, exist_ok=True)
 
@@ -603,8 +604,35 @@ def run_bcg_pipeline(segment_dir: Path = DEFAULT_SEGMENT_DIR, npc_grid=None):
 
 if __name__ == "__main__":
     import argparse
-    ap = argparse.ArgumentParser(description="BCG removal (EEGLAB fMRIB OBS) + resample 250 Hz")
-    ap.add_argument("--segment-dir", type=Path, default=DEFAULT_SEGMENT_DIR)
+    ap = argparse.ArgumentParser(description="STEP 08: BCG removal (EEGLAB fMRIB OBS) + resample 250 Hz")
+    ap.add_argument("--subject", default=None, help="Subject ID (e.g. 1916)")
+    ap.add_argument("--segment", default=None, help="Segment name (e.g. ec, drone) or omit for all segments of subject")
+    ap.add_argument("--all", action="store_true", help="Process all available subjects and segments")
     ap.add_argument("--npc", type=int, nargs="+", default=None, help="npc grid to sweep")
     args = ap.parse_args()
-    run_bcg_pipeline(args.segment_dir.resolve(), npc_grid=args.npc)
+
+    seg_dirs: list[Path] = []
+    if args.subject:
+        subj_seg_dir = DATA_ROOT / args.subject / "segments"
+        if args.segment:
+            target = subj_seg_dir / args.segment
+            if target.exists():
+                seg_dirs.append(target)
+            else:
+                print(f"[ERROR] Segment folder not found: {target}")
+        else:
+            if subj_seg_dir.exists():
+                seg_dirs.extend(sorted(p for p in subj_seg_dir.iterdir() if p.is_dir() and (p / "segment_work_info.json").exists()))
+            else:
+                print(f"[ERROR] No segments directory found for subject {args.subject}: {subj_seg_dir}")
+    elif args.all or (not args.subject and not args.segment):
+        for subj_dir in sorted(DATA_ROOT.glob("*")):
+            subj_seg_dir = subj_dir / "segments"
+            if subj_seg_dir.exists():
+                seg_dirs.extend(sorted(p for p in subj_seg_dir.iterdir() if p.is_dir() and (p / "segment_work_info.json").exists()))
+
+    if not seg_dirs:
+        print("[ERROR] No segments found with segment_work_info.json. Run previous steps first!")
+    else:
+        for sdir in seg_dirs:
+            run_bcg_pipeline(sdir.resolve(), npc_grid=args.npc)

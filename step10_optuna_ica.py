@@ -86,7 +86,8 @@ BRAIN_IDX = 0
 
 def _find_bcg_fif(segment_dir: Path) -> Path:
     seg = segment_dir.name
-    p = DATA_ROOT / DEFAULT_EXPERIMENT / "derivatives" / "03_bcg" / seg / f"{seg}_bcg_clean.fif"
+    subject_id = segment_dir.parent.parent.name if segment_dir.parent.name == "segments" else segment_dir.parent.name
+    p = DATA_ROOT / subject_id / "derivatives" / "03_bcg" / seg / f"{seg}_bcg_clean.fif"
     if not p.exists():
         raise FileNotFoundError(f"BCG input not found: {p}. Run step08 first.")
     return p
@@ -695,8 +696,35 @@ def plot_two_phase_summary(p1: list[dict], sweep: list[dict],
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Fast two-phase ICA parameter optimization")
-    parser.add_argument("--segment-dir", type=Path, default=DEFAULT_SEGMENT_DIR)
+    parser = argparse.ArgumentParser(description="STEP 10: Fast two-phase ICA parameter optimization")
+    parser.add_argument("--subject", default=None, help="Subject ID (e.g. 1916)")
+    parser.add_argument("--segment", default=None, help="Segment name (e.g. ec, drone) or omit for all segments of subject")
+    parser.add_argument("--all", action="store_true", help="Process all available subjects and segments")
     parser.add_argument("--n-trials", type=int, default=20, help="(unused; kept for compatibility)")
     args = parser.parse_args()
-    run_optuna_ica(args.segment_dir, args.n_trials)
+
+    seg_dirs: list[Path] = []
+    if args.subject:
+        subj_seg_dir = DATA_ROOT / args.subject / "segments"
+        if args.segment:
+            target = subj_seg_dir / args.segment
+            if target.exists():
+                seg_dirs.append(target)
+            else:
+                print(f"[ERROR] Segment folder not found: {target}")
+        else:
+            if subj_seg_dir.exists():
+                seg_dirs.extend(sorted(p for p in subj_seg_dir.iterdir() if p.is_dir() and (p / "segment_work_info.json").exists()))
+            else:
+                print(f"[ERROR] No segments directory found for subject {args.subject}: {subj_seg_dir}")
+    elif args.all or (not args.subject and not args.segment):
+        for subj_dir in sorted(DATA_ROOT.glob("*")):
+            subj_seg_dir = subj_dir / "segments"
+            if subj_seg_dir.exists():
+                seg_dirs.extend(sorted(p for p in subj_seg_dir.iterdir() if p.is_dir() and (p / "segment_work_info.json").exists()))
+
+    if not seg_dirs:
+        print("[ERROR] No segments found with segment_work_info.json. Run previous steps first!")
+    else:
+        for sdir in seg_dirs:
+            run_optuna_ica(sdir, args.n_trials)
