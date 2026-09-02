@@ -27,11 +27,19 @@ def img_to_b64(path: Path) -> str:
     return ""
 
 
-def generate_html_report(segment_dir: Path = DEFAULT_SEGMENT_DIR):
+def generate_html_report(segment_dir: Path = DEFAULT_SEGMENT_DIR, force: bool = False):
     segment_dir = Path(segment_dir).resolve()
     print("=" * 75)
     print(f"[STEP 07] Generating HTML cleaning & alpha quality report for: {segment_dir.name}")
     print("=" * 75)
+
+    out_html = segment_dir / f"{segment_dir.name}_cleaning_report.html"
+    if not force and out_html.exists():
+        print(f"  [SKIP] Bergen HTML report already exists: {out_html.name} (use --force to recompute)")
+        print("=" * 75)
+        print("  [STEP 07] ALREADY DONE.")
+        print("=" * 75)
+        return out_html
 
     npz_path = segment_dir / "step03_spectra_data.npz"
     if not npz_path.exists():
@@ -305,6 +313,7 @@ if __name__ == "__main__":
     parser.add_argument("--subject", default=None, help="Subject ID (e.g. 1916)")
     parser.add_argument("--segment", default=None, help="Segment name (e.g. ec, drone) or omit for all segments of subject")
     parser.add_argument("--all", action="store_true", help="Process all available subjects and segments")
+    parser.add_argument("--force", action="store_true", help="Force recomputation even if report exists")
     args = parser.parse_args()
 
     seg_dirs: list[Path] = []
@@ -331,4 +340,4 @@ if __name__ == "__main__":
         print("[ERROR] No segments found with segment_work_info.json. Run previous steps first!")
     else:
         for sdir in seg_dirs:
-            generate_html_report(segment_dir=sdir)
+            generate_html_report(segment_dir=sdir, force=args.force)

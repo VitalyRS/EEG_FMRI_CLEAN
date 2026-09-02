@@ -23,11 +23,22 @@ except ImportError:
 def clean_full_dataset(segment_dir: Path = DEFAULT_SEGMENT_DIR,
                        shift: int = None,
                        win_k: int = None,
-                       motion_thresh: float = None):
+                       motion_thresh: float = None,
+                       force: bool = False):
     segment_dir = Path(segment_dir).resolve()
     print("=" * 70)
     print(f"[STEP 05] Full Dataset Bergen Cleaning for: {segment_dir.name}")
     print("=" * 70)
+
+    # Check if cleaned .set already exists
+    existing_sets = list(segment_dir.glob("*bergen*optuna*.set")) or list(segment_dir.glob("*.set"))
+    if not force and existing_sets:
+        clean_set = max(existing_sets, key=lambda p: p.stat().st_mtime)
+        print(f"  [SKIP] Bergen-cleaned dataset already exists: {clean_set.name} (use --force to recompute)")
+        print("=" * 70)
+        print("  [STEP 05] ALREADY DONE.")
+        print("=" * 70)
+        return clean_set
 
     work_info_path = segment_dir / "segment_work_info.json"
     if not work_info_path.exists():
@@ -206,6 +217,7 @@ if __name__ == "__main__":
     parser.add_argument("--subject", default=None, help="Subject ID (e.g. 1916)")
     parser.add_argument("--segment", default=None, help="Segment name (e.g. ec, drone) or omit for all segments of subject")
     parser.add_argument("--all", action="store_true", help="Process all available subjects and segments")
+    parser.add_argument("--force", action="store_true", help="Force recomputation even if outputs exist")
     args = parser.parse_args()
 
     seg_dirs: list[Path] = []
@@ -232,5 +244,5 @@ if __name__ == "__main__":
         print("[ERROR] No segments found with segment_work_info.json. Run step03_trim_dummy.py first!")
     else:
         for sdir in seg_dirs:
-            clean_full_dataset(segment_dir=sdir)
+            clean_full_dataset(segment_dir=sdir, force=args.force)
 

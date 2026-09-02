@@ -66,6 +66,27 @@ FLATLINE_GRID = [5.0]
 CHANNEL_GRID = [0.70, 0.75, 0.80, 0.85]
 LINE_GRID = [4.0, 6.0]
 
+# ---- Phase-ASR grid for BurstCriterion (k = SD cutoff of the ASR reconstruction).
+# Higher k = gentler (fewer bursts touched). 'off' disables ASR entirely (the old
+# behaviour, kept as the conservative anchor). We sweep from gentle -> aggressive
+# and let scoring pick the SOFTEST k that still buys real artifact suppression,
+# so the neural signal is preserved as much as possible (the user's goal).
+BURST_GRID = ["off", 30.0, 20.0, 10.0]
+
+# Above ~40 Hz the reference band (80 Hz LP) still carries residual muscle / MRI
+# vibration that ASR is meant to knock down. We use the drop in 40-80 Hz power as
+# the "artifact suppression" signal and 8-13 Hz (alpha) retention as the "signal
+# preserved" signal when picking k.
+HF_ARTIFACT_BAND = (40.0, 80.0)
+
+# Minimum HF-power drop (fraction) an ASR setting must deliver over 'off' before
+# we consider it worth the risk to the signal. Below this, ASR is doing nothing
+# useful and we keep the gentler / 'off' setting.
+ASR_MIN_HF_GAIN = 0.05      # 5% extra 40-80 Hz suppression vs 'off'
+# Hard floor on alpha retention: an ASR k that drops alpha below this is
+# over-correcting into neural territory and is disqualified.
+ASR_MIN_ALPHA_RET = 0.90
+
 # ---- Phase 3 threshold sweep ----
 THRESHOLD_GRID = [0.65, 0.70, 0.75, 0.80, 0.85]
 
@@ -243,6 +264,177 @@ def score_phase1(candidate: dict, n_channels_original: int) -> float:
              + 1.0 * n_removed
              + 0.5 * abs(candidate["channel_crit"] - 0.80))
     return score
+
+
+# ---------------------------------------------------------------------------
+# Phase-ASR: sweep BurstCriterion (k) in ONE MATLAB session, return cleaned data
+# ---------------------------------------------------------------------------
+def run_phase_asr(work_dir: Path, mat_in: Path, best_ch: dict) -> list[dict]:
+    """
+    With the Phase-1 winning channel params fixed, run clean_rawdata for each k
+    in BURST_GRID (BurstRejection='off' => reconstruct-in-place, duration kept)
+    inside ONE MATLAB session. Returns [{burst_crit, data (n_ch x n_samp, uV)}].
+
+    ASR is a MATLAB clean_rawdata operation, so unlike the ICLabel threshold it
+    cannot be swept in pure Python -- but running all k in a single MATLAB call
+    keeps it cheap (channel detection + ASR only, no ICA).
+    """
+    out_mat = work_dir / "phase_asr.mat"
+    m_file = work_dir / "phase_asr.m"
+    clean_rawdata_plugin = EEGLAB_DIR / "plugins" / "clean_rawdata"
+
+    # MATLAB cell of burst settings ('off' or numeric).
+    burst_items = ["'off'" if (isinstance(b, str) and b == "off") else f"{float(b)}"
+                   for b in BURST_GRID]
+    burst_ml = "{" + ", ".join(burst_items) + "}"
+
+    code = f"""
+addpath('{EEGLAB_DIR.resolve()}');
+addpath('{clean_rawdata_plugin.resolve()}');
+addpath('{DIPFIT_DIR.resolve()}');
+eeglab nogui;
+
+load('{mat_in.resolve()}', 'data', 'srate', 'labels');
+EEG = eeg_emptyset();
+EEG.setname = 'phase_asr';
+EEG.data = double(data);
+EEG.srate = double(srate);
+EEG.nbchan = size(data, 1);
+EEG.pnts = size(data, 2);
+EEG.trials = 1;
+EEG.xmin = 0;
+EEG.xmax = (EEG.pnts - 1) / EEG.srate;
+EEG.chanlocs = struct([]);
+for i = 1:EEG.nbchan
+    if iscell(labels)
+        EEG.chanlocs(i).labels = char(labels{{i}});
+    else
+        EEG.chanlocs(i).labels = deblank(labels(i,:));
+    end
+end
+EEG = eeg_checkset(EEG);
+EEG = pop_chanedit(EEG, 'lookup', '{STD_1005.resolve()}');
+EEG = eeg_checkset(EEG);
+
+burst_grid = {burst_ml};
+res = struct('burst', {{}}, 'data', {{}});
+for bi = 1:numel(burst_grid)
+    bc = burst_grid{{bi}};
+    % Same channel params for every k so the ONLY difference is ASR strength.
+    EEG_c = pop_clean_rawdata(EEG, ...
+        'FlatlineCriterion', {best_ch['flatline_crit']}, ...
+        'ChannelCriterion', {best_ch['channel_crit']}, ...
+        'LineNoiseCriterion', {best_ch['line_crit']}, ...
+        'Highpass', 'off', ...
+        'BurstCriterion', bc, ...
+        'WindowCriterion', 'off', ...
+        'BurstRejection', 'off', ...
+        'Distance', 'Euclidian');
+    % Re-project onto the original channel set so every k has the same shape
+    % (channel detection can differ slightly; interpolate back for fair PSD).
+    if EEG_c.nbchan < EEG.nbchan
+        EEG_c = pop_interp(EEG_c, EEG.chanlocs, 'spherical');
+    end
+    if ischar(bc)
+        res(bi).burst = -1;   % sentinel for 'off'
+    else
+        res(bi).burst = bc;
+    end
+    res(bi).data = single(EEG_c.data);
+end
+save('{out_mat.resolve()}', 'res', '-v7');
+clear EEG EEG_c;
+exit(0);
+"""
+    with open(m_file, "w", encoding="ascii") as f:
+        f.write(code)
+
+    print(f"  [Phase-ASR] Sweeping BurstCriterion {BURST_GRID} (one MATLAB session)...")
+    try:
+        r = subprocess.run(
+            [str(MATLAB_BIN), "-nodesktop", "-nosplash", "-batch", f"run('{m_file.resolve()}')"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=1800
+        )
+    except subprocess.TimeoutExpired:
+        print("  [Phase-ASR] MATLAB timed out; skipping ASR tuning (keeping 'off').")
+        m_file.unlink(missing_ok=True)
+        return []
+    m_file.unlink(missing_ok=True)
+
+    if r.returncode != 0 or not out_mat.exists():
+        print(f"  [Phase-ASR] MATLAB failed (rc={r.returncode}); keeping ASR 'off'.")
+        print(r.stdout[-1500:] if r.stdout else "(no output)")
+        return []
+
+    m = loadmat(out_mat, squeeze_me=False, struct_as_record=False)
+    out_mat.unlink(missing_ok=True)
+    raw_res = np.atleast_1d(m["res"].ravel())
+
+    out = []
+    for rr in raw_res:
+        b = float(np.asarray(rr.burst).ravel()[0])
+        burst = "off" if b < 0 else b
+        out.append({
+            "burst_crit": burst,
+            "data": np.asarray(rr.data, dtype=np.float64) * 1e-6,  # uV -> V
+        })
+    return out
+
+
+def score_phase_asr(asr_results: list[dict], sfreq: float) -> dict:
+    """
+    Pick the SOFTEST BurstCriterion k that still delivers real high-frequency
+    artifact suppression without eating alpha. 'off' is the baseline.
+
+    For each k:  hf_drop  = 1 - P_hf(k) / P_hf(off)      (40-80 Hz)  [want high]
+                 alpha_ret = P_alpha(k) / P_alpha(off)    (8-13 Hz)   [want ~1]
+
+    Selection: among settings meeting ASR_MIN_ALPHA_RET, choose the one whose
+    hf_drop beats 'off' by >= ASR_MIN_HF_GAIN; if several qualify, take the
+    gentlest (largest k). If none qualify, keep 'off' (preserve the signal).
+    """
+    def band_power(data, lo, hi):
+        nperseg = int(min(4 * sfreq, data.shape[-1]))
+        f, psd = welch(data, sfreq, nperseg=nperseg, axis=-1)
+        m = (f >= lo) & (f <= hi)
+        return float(np.mean(psd[:, m]))
+
+    base = next((r for r in asr_results if r["burst_crit"] == "off"), None)
+    if base is None:
+        base = asr_results[0]
+    p_hf_off = band_power(base["data"], *HF_ARTIFACT_BAND)
+    p_alpha_off = band_power(base["data"], *ALPHA_BAND)
+
+    scored = []
+    for r in asr_results:
+        p_hf = band_power(r["data"], *HF_ARTIFACT_BAND)
+        p_alpha = band_power(r["data"], *ALPHA_BAND)
+        hf_drop = 1.0 - p_hf / max(p_hf_off, 1e-20)
+        alpha_ret = p_alpha / max(p_alpha_off, 1e-20)
+        scored.append({
+            "burst_crit": r["burst_crit"],
+            "hf_drop": float(hf_drop),
+            "alpha_ret": float(alpha_ret),
+        })
+        tag = "off" if r["burst_crit"] == "off" else f"k={r['burst_crit']:.0f}"
+        print(f"    [Phase-ASR] {tag:>6s}: HF-drop={hf_drop:+.1%}  alpha-ret={alpha_ret:.2f}")
+
+    # Numeric candidates that preserve alpha AND actually suppress HF artifact.
+    qualifiers = [
+        s for s in scored
+        if s["burst_crit"] != "off"
+        and s["alpha_ret"] >= ASR_MIN_ALPHA_RET
+        and s["hf_drop"] >= ASR_MIN_HF_GAIN
+    ]
+    if qualifiers:
+        # Softest = largest k among qualifiers (preserve signal maximally).
+        best = max(qualifiers, key=lambda s: s["burst_crit"])
+        print(f"    [Phase-ASR] -> chose k={best['burst_crit']:.0f} "
+              f"(HF-drop {best['hf_drop']:.1%}, alpha {best['alpha_ret']:.2f})")
+    else:
+        best = {"burst_crit": "off", "hf_drop": 0.0, "alpha_ret": 1.0}
+        print("    [Phase-ASR] -> no k beat 'off' safely; keeping ASR off.")
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -536,7 +728,7 @@ def sweep_thresholds(ica: dict, sfreq: float, n_channels_original: int) -> list[
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
-def run_optuna_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, n_trials: int = 20):
+def run_optuna_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, n_trials: int = 20, force: bool = False):
     """
     Two-phase ICA parameter optimization. `n_trials` is kept for signature
     compatibility with run_all.py but is no longer used (the search is now a
@@ -546,6 +738,17 @@ def run_optuna_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, n_trials: int = 20):
     print("=" * 80)
     print(f"[STEP 10] Fast Two-Phase ICA Parameter Optimization for: {segment_dir.name}")
     print("=" * 80)
+
+    params_json = segment_dir / "optuna_ica_best_params.json"
+    alt_json = segment_dir / "ica_optuna_best.json"
+    out_png = segment_dir / "optuna_ica_result.png"
+    if not force and (params_json.exists() or alt_json.exists()) and out_png.exists():
+        p_path = params_json if params_json.exists() else alt_json
+        print(f"  [SKIP] ICA parameter optimization already computed: {p_path.name} (use --force to recompute)")
+        print("=" * 80)
+        print("  [STEP 10] ALREADY DONE.")
+        print("=" * 80)
+        return p_path
 
     fif = _find_bcg_fif(segment_dir)
     print(f"  Loading BCG-cleaned data: {fif.name}")
@@ -564,6 +767,15 @@ def run_optuna_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, n_trials: int = 20):
 
     work_dir = segment_dir / "optuna_ica_trials"
     work_dir.mkdir(exist_ok=True)
+
+    # On --force, the upstream BCG/band-pass may have changed (e.g. new filter
+    # band), so a cached ICA computed on the old data is stale. Drop it so
+    # Phase 2 recomputes ICA on the current input.
+    if force:
+        stale = work_dir / "phase2_ica_cache.npz"
+        if stale.exists():
+            stale.unlink()
+            print("  [force] Dropped stale Phase-2 ICA cache; will recompute ICA.")
 
     mat_in = work_dir / "input_bcg.mat"
     savemat(mat_in, {
@@ -603,6 +815,15 @@ def run_optuna_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, n_trials: int = 20):
         print(f"\n  [Phase 2] ICA done: {ica['n_ic']} ICs, "
               f"{ica['n_removed']} channels removed.\n")
 
+    # ---- Phase-ASR: tune BurstCriterion (softest k that still suppresses HF) ----
+    best_burst = "off"
+    try:
+        asr_results = run_phase_asr(work_dir, mat_in, best_ch)
+        if asr_results:
+            best_burst = score_phase_asr(asr_results, sfreq)["burst_crit"]
+    except Exception as e:
+        print(f"  [Phase-ASR] skipped ({e}); keeping ASR 'off'.")
+
     mat_in.unlink(missing_ok=True)
 
     # ---- Phase 3: threshold sweep (Python) ----
@@ -615,6 +836,7 @@ def run_optuna_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, n_trials: int = 20):
         "channel_crit": float(best_ch["channel_crit"]),
         "line_crit": float(best_ch["line_crit"]),
         "iclabel_thresh": float(best_thresh),
+        "burst_crit": (best_burst if best_burst == "off" else float(best_burst)),
     }
 
     print("\n" + "=" * 80)
@@ -626,6 +848,7 @@ def run_optuna_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, n_trials: int = 20):
           f"varDrop={best_sweep['variance_drop']:.2f}, "
           f"icRej={best_sweep['n_ic_rejected']}/{best_sweep['n_ic_total']}, "
           f"Loss={best_sweep['loss']:.2f})")
+    print(f"  Best ASR BurstCriterion = {best_burst}")
     print("=" * 80)
 
     res_dict = {
@@ -701,6 +924,7 @@ if __name__ == "__main__":
     parser.add_argument("--segment", default=None, help="Segment name (e.g. ec, drone) or omit for all segments of subject")
     parser.add_argument("--all", action="store_true", help="Process all available subjects and segments")
     parser.add_argument("--n-trials", type=int, default=20, help="(unused; kept for compatibility)")
+    parser.add_argument("--force", action="store_true", help="Force recomputation even if outputs exist")
     args = parser.parse_args()
 
     seg_dirs: list[Path] = []
@@ -727,4 +951,4 @@ if __name__ == "__main__":
         print("[ERROR] No segments found with segment_work_info.json. Run previous steps first!")
     else:
         for sdir in seg_dirs:
-            run_optuna_ica(sdir, args.n_trials)
+            run_optuna_ica(sdir, args.n_trials, force=args.force)

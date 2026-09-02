@@ -48,6 +48,7 @@ data/
 raw_data/
 processed_data/
 trial*/
+reports/
 
 # Subject directories (e.g. 1916/ or any numeric subject folders)
 [0-9]*/

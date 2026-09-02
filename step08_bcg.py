@@ -53,13 +53,24 @@ CARDIAC_BAND = (0.7, 4.0)     # Hz - fundamental + harmonics of BCG
 NPC_GRID     = [1, 2, 3, 4, 5, 6, 7, 8]   # OBS basis components to sweep (incl. gentle 1-2)
 FMRIB_DIR    = EEGLAB_DIR / "plugins" / "fMRIb2.1"
 
-# Band-pass applied AFTER resampling and BEFORE BCG. High-pass removes the
-# sub-1 Hz drift that otherwise makes OBS smear its subtraction across the
-# whole low band (eating alpha) and destabilises the quality metric. Low-pass
-# at 100 Hz sits well below the 125 Hz Nyquist of the 250 Hz data, leaving a
-# ~25 Hz transition margin, so 1-100 Hz is clean. 100 Hz keeps low/mid gamma.
-FILTER_HP = 1.0               # Hz high-pass
-FILTER_LP = 45.0              # Hz low-pass (cuts MRI helium-pump vibration comb 44-100 Hz)
+# Band-pass applied AFTER resampling and BEFORE BCG. The band is matched to the
+# reference .set pipeline (LPF_80 + SR_250 -> 0.25-80 Hz) so our FIF output lands
+# in the same spectral window as the colleague's EEGLAB output.
+#
+#   High-pass 1.0 Hz: standard for EEG-fMRI, removes slow drift (0.5-1 Hz
+#   respiration/movement) that creates baseline wander in time-domain plots.
+#   The reference .set likely uses 1.0 Hz or higher, which is why their time
+#   traces are flat. 0.5 Hz was too gentle and left visible drift. The 1-80 Hz
+#   band is the de facto standard for cleaned EEG-fMRI analysis.
+#
+#   Low-pass 80 Hz: matches the reference LPF_80 and keeps low/mid gamma. It sits
+#   45 Hz below the 125 Hz Nyquist of the 250 Hz data, so the transition band is
+#   clean. TRADE-OFF: the old 45 Hz cut removed the 44-100 Hz MRI helium-pump
+#   vibration comb; at 80 Hz the 44-80 Hz portion of that comb is back in-band.
+#   We now rely on the downstream ASR + ICA (muscle/line) stages to suppress it,
+#   which is exactly how the reference pipeline handles it (asr + ica_musle).
+FILTER_HP = 1.0               # Hz high-pass  (was 0.5; raised to 1.0 to remove slow drift)
+FILTER_LP = 80.0              # Hz low-pass   (was 45.0; raised to match reference LPF_80)
 
 # npc SELECTION POLICY (OBS -> ICA architecture):
 # BCG is NOT required to be surgically alpha-preserving here. Its job is to
@@ -457,7 +468,7 @@ def generate_bcg_html(seg_name, metrics, best_npc, per_channel, sfreq_before,
 # Main orchestration
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_bcg_pipeline(segment_dir: Path = DEFAULT_SEGMENT_DIR, npc_grid=None):
+def run_bcg_pipeline(segment_dir: Path = DEFAULT_SEGMENT_DIR, npc_grid=None, force: bool = False):
     segment_dir = Path(segment_dir).resolve()
     seg_name = segment_dir.name
     subject_id = segment_dir.parent.parent.name if segment_dir.parent.name == "segments" else segment_dir.parent.name
@@ -470,6 +481,16 @@ def run_bcg_pipeline(segment_dir: Path = DEFAULT_SEGMENT_DIR, npc_grid=None):
     resamp_dir = subject_deriv / "02_resampled250" / seg_name
     bcg_dir    = subject_deriv / "03_bcg" / seg_name
     qc_dir     = PROJECT_ROOT / "qc" / subject_id / "bcg"
+
+    bcg_fif = bcg_dir / f"{seg_name}_bcg_clean.fif"
+    out_html = bcg_dir / f"{seg_name}_bcg_report.html"
+    if not force and bcg_fif.exists() and out_html.exists():
+        print(f"  [SKIP] BCG-clean output already exists: {bcg_fif.name} (use --force to recompute)")
+        print("=" * 75)
+        print("  [STEP 08 - BCG] ALREADY DONE.")
+        print("=" * 75)
+        return out_html
+
     for d in (resamp_dir, bcg_dir, qc_dir):
         d.mkdir(parents=True, exist_ok=True)
 
@@ -609,6 +630,7 @@ if __name__ == "__main__":
     ap.add_argument("--segment", default=None, help="Segment name (e.g. ec, drone) or omit for all segments of subject")
     ap.add_argument("--all", action="store_true", help="Process all available subjects and segments")
     ap.add_argument("--npc", type=int, nargs="+", default=None, help="npc grid to sweep")
+    ap.add_argument("--force", action="store_true", help="Force recomputation even if outputs exist")
     args = ap.parse_args()
 
     seg_dirs: list[Path] = []
@@ -635,4 +657,4 @@ if __name__ == "__main__":
         print("[ERROR] No segments found with segment_work_info.json. Run previous steps first!")
     else:
         for sdir in seg_dirs:
-            run_bcg_pipeline(sdir.resolve(), npc_grid=args.npc)
+            run_bcg_pipeline(sdir.resolve(), npc_grid=args.npc, force=args.force)

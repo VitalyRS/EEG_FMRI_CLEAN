@@ -24,9 +24,9 @@ import shutil
 from pathlib import Path
 
 try:
-    from .config import (DEFAULT_SEGMENT_DIR, DEFAULT_RAW_VHDR, DEFAULT_N_TRIALS,
+    from .config import (DEFAULT_RAW_VHDR, DEFAULT_N_TRIALS,
                          PROJECT_ROOT, DATA_ROOT, DEFAULT_EXPERIMENT)
-    from .step01_detect_mri import detect_mri_sessions
+    from .step01_detect_mri import detect_mri_sessions, discover_all_eeg_vhdrs
     from .step02_detect_slices import run_detect_slices
     from .step03_trim_dummy import trim_dummy_scans
     from .step04_optuna_tune import run_optuna_tuning
@@ -38,9 +38,9 @@ try:
     from .step11_ica_final import apply_optimized_ica
     from .step12_summary_report import generate_summary_report
 except ImportError:
-    from config import (DEFAULT_SEGMENT_DIR, DEFAULT_RAW_VHDR, DEFAULT_N_TRIALS,
+    from config import (DEFAULT_RAW_VHDR, DEFAULT_N_TRIALS,
                         PROJECT_ROOT, DATA_ROOT, DEFAULT_EXPERIMENT)
-    from step01_detect_mri import detect_mri_sessions
+    from step01_detect_mri import detect_mri_sessions, discover_all_eeg_vhdrs
     from step02_detect_slices import run_detect_slices
     from step03_trim_dummy import trim_dummy_scans
     from step04_optuna_tune import run_optuna_tuning
@@ -84,9 +84,10 @@ def clean_all_derivatives(seg_dir: Path):
     Raw recordings (data/<subject>/raw/) and pipeline code are never touched.
     """
     seg = seg_dir.name
-    subject = DEFAULT_EXPERIMENT
+    subject = (seg_dir.parent.parent.name if seg_dir.parent.name == "segments"
+               else seg_dir.parent.name)
     print("=" * 80)
-    print(f"  [--recalc] FORCING FULL RECOMPUTE for segment '{seg}'")
+    print(f"  [--recalc] FORCING FULL RECOMPUTE for segment '{subject}/{seg}'")
     print("=" * 80)
 
     removed = []
@@ -153,21 +154,56 @@ def clean_all_derivatives(seg_dir: Path):
     print("=" * 80 + "\n")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="End-to-End Optuna-Bergen EEG-fMRI Pipeline + ICA")
-    parser.add_argument("--segment-dir", type=Path, default=DEFAULT_SEGMENT_DIR, help="Path to segment folder")
-    parser.add_argument("--vhdr-raw", type=Path, default=DEFAULT_RAW_VHDR, help="Path to continuous raw .vhdr")
-    parser.add_argument("--trials", type=int, default=DEFAULT_N_TRIALS, help="Number of Optuna trials (Bergen & ICA)")
-    parser.add_argument("--skip-detect-mri", action="store_true", help="Skip Step 01 (session detection)")
-    parser.add_argument("--skip-optuna", action="store_true", help="Skip Step 04 (use existing/default Bergen params)")
-    parser.add_argument("--skip-bcg", action="store_true", help="Skip Step 08 (BCG removal)")
-    parser.add_argument("--skip-ica-optuna", action="store_true", help="Skip Step 10 (use existing/default ICA params)")
-    parser.add_argument("--skip-ica", action="store_true", help="Skip Steps 10-11 (ICA entirely)")
-    parser.add_argument("--recalc", action="store_true",
-                        help="Delete ALL computed artifacts for this segment first, forcing a full recompute (raw inputs are preserved)")
-    args = parser.parse_args()
+# Canonical processing order for named segments. Segments not listed here are
+# appended afterwards in alphabetical order, so unknown names still get run.
+SEGMENT_ORDER = ["eo", "ec", "drone", "lasertag", "video"]
 
-    seg_dir = args.segment_dir.resolve()
+
+def _order_segments(dirs):
+    """Sort segment dirs by SEGMENT_ORDER, unknown names last (alphabetical)."""
+    def key(d):
+        try:
+            return (0, SEGMENT_ORDER.index(d.name))
+        except ValueError:
+            return (1, d.name)
+    return sorted(dirs, key=key)
+
+
+def _discover_segments(args) -> list:
+    """Resolve the list of segment dirs to process from CLI flags.
+
+    Priority: --segment-dir (explicit single) > --subject (all segments of one
+    subject) > --all (every segment of every subject under data/). With no
+    selection flag we fall back to the default subject (config.DEFAULT_EXPERIMENT)
+    and process all of its segments. A valid segment dir is one that contains
+    (or will contain) segment_info.json — an immediate child of a
+    data/<subject>/segments/ folder. Named segments are processed in
+    SEGMENT_ORDER (eo, ec, drone, lasertag, video).
+    """
+    # Explicit single segment always wins.
+    if args.segment_dir is not None:
+        return [args.segment_dir.resolve()]
+
+    # --all across every subject, --subject for one, else the default subject.
+    if args.all:
+        subjects = [d.name for d in sorted(DATA_ROOT.glob("*")) if d.is_dir()]
+    elif args.subject:
+        subjects = [args.subject]
+    else:
+        subjects = [DEFAULT_EXPERIMENT]
+
+    seg_dirs = []
+    for sid in subjects:
+        seg_root = DATA_ROOT / sid / "segments"
+        if not seg_root.exists():
+            continue
+        subject_dirs = [d.resolve() for d in seg_root.iterdir() if d.is_dir()]
+        seg_dirs.extend(_order_segments(subject_dirs))
+    return seg_dirs
+
+
+def run_segment(seg_dir: Path, args):
+    """Run the full 01->12 pipeline for a single segment directory."""
     print("=" * 80)
     print("  OPTUNA-BERGEN EEG-fMRI PIPELINE + BCG + ICA (END-TO-END)")
     print(f"  Target Segment: {seg_dir}")
@@ -179,8 +215,12 @@ def main():
     # ---- Output markers used to skip already-computed steps -----------------
     # By default a step is skipped if its marker(s) already exist (incremental).
     # --recalc deletes everything above, so all markers are gone -> full rerun.
+    # Subject is derived from the segment path (data/<subject>/segments/<seg>),
+    # so this works for any subject, not just DEFAULT_EXPERIMENT.
     seg = seg_dir.name
-    deriv = DATA_ROOT / DEFAULT_EXPERIMENT / "derivatives"
+    subject = (seg_dir.parent.parent.name if seg_dir.parent.name == "segments"
+               else seg_dir.parent.name)
+    deriv = DATA_ROOT / subject / "derivatives"
     M = {
         "01": seg_dir / "segment_info.json",
         "02": seg_dir / "slice_detection.json",
@@ -199,15 +239,24 @@ def main():
     def _skip(step, reason="already computed"):
         print(f"[SKIP] Step {step}: {reason} (use --recalc to force).")
 
-    # Step 01
+    # Step 01: detect MRI sessions & write segment_info.json for every session
+    # of THIS subject. detect_mri_sessions writes all segments at once, so the
+    # marker for any one segment implies step01 already ran for the subject.
     if args.skip_detect_mri:
         print("[INFO] Step 01 skipped by flag.")
-    elif not args.vhdr_raw.exists():
-        print("[INFO] Step 01 skipped: raw VHDR not found.")
     elif _is_done(M["01"]):
         _skip("01")
     else:
-        detect_mri_sessions(args.vhdr_raw)
+        # Resolve the raw vhdr for THIS subject (not the global default).
+        vhdr = None
+        if args.vhdr_raw and args.vhdr_raw.exists() and subject in args.vhdr_raw.parts:
+            vhdr = args.vhdr_raw  # explicit override matching this subject
+        else:
+            vhdr = discover_all_eeg_vhdrs().get(subject)
+        if vhdr is None:
+            print(f"[INFO] Step 01 skipped: no raw VHDR found for subject {subject}.")
+        else:
+            detect_mri_sessions(vhdr_path=vhdr, subject_id=subject)
 
     # Step 02
     if _is_done(M["02"]):
@@ -215,11 +264,13 @@ def main():
     else:
         run_detect_slices(seg_dir)
 
-    # Step 03
+    # Step 03: trim dummy scans. dummy_volumes=None -> auto-detect from the time
+    # alignment between the detected segment span and the fMRI task (rp volumes),
+    # so the trimmed EEG window matches the task. A per-run --dummy N forces it.
     if _is_done(M["03"]):
         _skip("03")
     else:
-        trim_dummy_scans(seg_dir)
+        trim_dummy_scans(seg_dir, dummy_volumes=args.dummy)
 
     # Step 04
     if args.skip_optuna:
@@ -288,13 +339,15 @@ def main():
     print("=" * 80)
     summary_html = None
     try:
-        summary_html = generate_summary_report(seg_dir)
+        # On --recalc every upstream artifact was recomputed, so the summary must
+        # be rebuilt too (it lives outside seg_dir and is not wiped by --recalc).
+        summary_html = generate_summary_report(seg_dir, force=args.recalc)
     except Exception as ex:
         print(f"[WARN] Step 12 summary report failed: {ex}")
 
     print("\n" + "=" * 80)
-    print("  ALL PIPELINE STEPS FINISHED SUCCESSFULLY!")
-    print(f"  Bergen Report: {html_path.resolve()}")
+    print(f"  ALL PIPELINE STEPS FINISHED SUCCESSFULLY! ({subject}/{seg})")
+    print(f"  Bergen Report: {Path(html_path).resolve()}")
     if not args.skip_ica:
         ica_report = deriv / "05_ica" / seg / f"{seg}_ica_report.html"
         if ica_report.exists():
@@ -302,6 +355,72 @@ def main():
     if summary_html:
         print(f"  SUMMARY:       {summary_html.resolve()}")
     print("=" * 80)
+    return summary_html
+
+
+def main():
+    parser = argparse.ArgumentParser(description="End-to-End Optuna-Bergen EEG-fMRI Pipeline + ICA")
+    parser.add_argument("--segment-dir", type=Path, default=None,
+                        help="Path to a single segment folder. If omitted, all segments of "
+                             "--subject (or the default subject) are processed in order "
+                             "(eo, ec, drone, lasertag, video).")
+    parser.add_argument("--subject", default=None, help="Process every segment of this subject (e.g. 1916)")
+    parser.add_argument("--all", action="store_true", help="Process every segment of every subject under data/")
+    parser.add_argument("--vhdr-raw", type=Path, default=DEFAULT_RAW_VHDR, help="Path to continuous raw .vhdr (Step 01, single-segment mode only)")
+    parser.add_argument("--trials", type=int, default=DEFAULT_N_TRIALS, help="Number of Optuna trials (Bergen & ICA)")
+    parser.add_argument("--dummy", type=int, default=None,
+                        help="Force an exact dummy-volume count for Step 03 (e.g. 13). "
+                             "Omit to auto-detect per segment from time alignment. "
+                             "Only valid for a single segment, not --all/--subject.")
+    parser.add_argument("--skip-detect-mri", action="store_true", help="Skip Step 01 (session detection)")
+    parser.add_argument("--skip-optuna", action="store_true", help="Skip Step 04 (use existing/default Bergen params)")
+    parser.add_argument("--skip-bcg", action="store_true", help="Skip Step 08 (BCG removal)")
+    parser.add_argument("--skip-ica-optuna", action="store_true", help="Skip Step 10 (use existing/default ICA params)")
+    parser.add_argument("--skip-ica", action="store_true", help="Skip Steps 10-11 (ICA entirely)")
+    parser.add_argument("--recalc", action="store_true",
+                        help="Delete ALL computed artifacts for each segment first, forcing a full recompute (raw inputs are preserved)")
+    args = parser.parse_args()
+
+    if args.dummy is not None and (args.all or args.subject):
+        parser.error("--dummy forces one dummy count and cannot be combined with "
+                     "--all/--subject (each segment needs its own). Run a single "
+                     "--segment-dir, or omit --dummy to auto-detect per segment.")
+
+    seg_dirs = _discover_segments(args)
+    if not seg_dirs:
+        print("[ERROR] No segment directories found. Check --subject/--all or run step01 first.")
+        return
+
+    multi = len(seg_dirs) > 1
+    if multi:
+        print("#" * 80)
+        print(f"  BATCH RUN: {len(seg_dirs)} segment(s)")
+        for s in seg_dirs:
+            print(f"    - {s.relative_to(DATA_ROOT) if DATA_ROOT in s.parents else s}")
+        print("#" * 80 + "\n")
+
+    ok, failed = [], []
+    for seg_dir in seg_dirs:
+        try:
+            run_segment(seg_dir, args)
+            ok.append(seg_dir)
+        except Exception as ex:
+            failed.append((seg_dir, ex))
+            print("\n" + "!" * 80)
+            print(f"  [FAILED] Segment {seg_dir} raised: {ex}")
+            print("  Continuing with the next segment." if multi else "")
+            print("!" * 80 + "\n")
+            if not multi:
+                raise
+
+    if multi:
+        print("\n" + "#" * 80)
+        print(f"  BATCH DONE — {len(ok)} ok, {len(failed)} failed")
+        for s in ok:
+            print(f"    [OK]     {s.name}")
+        for s, ex in failed:
+            print(f"    [FAILED] {s.name}: {ex}")
+        print("#" * 80)
 
 
 if __name__ == "__main__":

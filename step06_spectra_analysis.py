@@ -110,11 +110,93 @@ def compute_alpha_metrics(f: np.ndarray, psd: np.ndarray, comb_hz: float = SLICE
     }
 
 
-def compute_spectra(segment_dir: Path = DEFAULT_SEGMENT_DIR):
+import ctypes
+
+
+def _free_memory():
+    """Explicitly garbage-collect and return heap pages to the OS kernel."""
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _load_raw_eval_channels(raw_vhdr: Path, t_start: float, t_stop: float, eval_channels: list):
+    """Memory-efficient loader for raw BrainVision: reads only evaluation channels and work window."""
+    raw_raw = mne.io.read_raw_brainvision(raw_vhdr, preload=False, verbose=False)
+    sfreq_raw = float(raw_raw.info["sfreq"])
+    raw_eval_picks = [ch for ch in raw_raw.ch_names if ch.upper() in [e.upper() for e in eval_channels]]
+    
+    start_samp = max(0, int(round(t_start * sfreq_raw)))
+    stop_samp = min(raw_raw.n_times, int(round(t_stop * sfreq_raw)))
+    
+    # Read only the required channels & window in float32 directly
+    arr = raw_raw.get_data(picks=raw_eval_picks, start=start_samp, stop=stop_samp, units="uV").astype(np.float32)
+    names = [raw_raw.ch_names[p] if isinstance(p, int) else p for p in raw_eval_picks]
+    del raw_raw
+    _free_memory()
+    
+    res = {}
+    for name, data_1d in zip(names, arr):
+        res[name.upper()] = data_1d
+    return res, sfreq_raw
+
+
+def _load_clean_eval_channels(clean_set: Path, eval_channels: list):
+    """Memory-efficient loader for EEGLAB .set: parses MAT v7 without duplicating structures."""
+    import scipy.io as sio
+    try:
+        mat_meta = sio.loadmat(clean_set, variable_names=["srate", "chanlocs"], squeeze_me=True, struct_as_record=False)
+        sfreq_clean = float(mat_meta["srate"])
+        chanlocs = mat_meta["chanlocs"]
+        if hasattr(chanlocs, "__iter__"):
+            chan_names = [getattr(ch, "labels", str(ch)) for ch in chanlocs]
+        else:
+            chan_names = [getattr(chanlocs, "labels", str(chanlocs))]
+        del mat_meta
+        _free_memory()
+        
+        mat_data = sio.loadmat(clean_set, variable_names=["data"], squeeze_me=True)
+        data_all = mat_data["data"]
+        
+        res = {}
+        for ch in eval_channels:
+            idx = [i for i, name in enumerate(chan_names) if name.upper() == ch.upper()]
+            if idx:
+                res[ch.upper()] = data_all[idx[0], :].astype(np.float32)
+        del mat_data, data_all
+        _free_memory()
+        return res, sfreq_clean
+    except Exception:
+        # Fallback to MNE without copying
+        clean_raw = mne.io.read_raw_eeglab(clean_set, preload=False, verbose=False)
+        sfreq_clean = float(clean_raw.info["sfreq"])
+        clean_eval_picks = [ch for ch in clean_raw.ch_names if ch.upper() in [e.upper() for e in eval_channels]]
+        arr = clean_raw.get_data(picks=clean_eval_picks, units="uV").astype(np.float32)
+        names = [clean_raw.ch_names[p] if isinstance(p, int) else p for p in clean_eval_picks]
+        del clean_raw
+        _free_memory()
+        res = {name.upper(): d for name, d in zip(names, arr)}
+        return res, sfreq_clean
+
+
+def compute_spectra(segment_dir: Path = DEFAULT_SEGMENT_DIR, force: bool = False):
     segment_dir = Path(segment_dir).resolve()
     print("=" * 75)
     print(f"[STEP 06] Quantitative Alpha Quality & Spectra Analysis: {segment_dir.name}")
     print("=" * 75)
+
+    summary_csv = segment_dir / "summary_alpha_quality.csv"
+    out_npz = segment_dir / "step03_spectra_data.npz"
+    out_png = segment_dir / "step03_spectra.png"
+    alpha_png = segment_dir / "alpha_quality_check.png"
+    if not force and summary_csv.exists() and out_npz.exists() and out_png.exists() and alpha_png.exists():
+        print(f"  [SKIP] Spectral analysis already computed: {summary_csv.name}, {out_npz.name} (use --force to recompute)")
+        print("=" * 75)
+        print("  [STEP 06] ALREADY DONE.")
+        print("=" * 75)
+        return dict(np.load(out_npz))
 
     work_info_path = segment_dir / "segment_work_info.json"
     if not work_info_path.exists():
@@ -139,41 +221,31 @@ def compute_spectra(segment_dir: Path = DEFAULT_SEGMENT_DIR):
 
     # 1. Compute Raw PSD directly from continuous raw VHDR (only EVAL_CHANNELS)
     print(f"  Reading raw EEG window [{t_start:.2f}s .. {t_stop:.2f}s] from: {raw_vhdr.name}")
-    raw_raw = mne.io.read_raw_brainvision(raw_vhdr, preload=False, verbose=False)
-    sfreq_raw = float(raw_raw.info["sfreq"])
-    raw_eval_picks = [ch for ch in raw_raw.ch_names if ch.upper() in [e.upper() for e in EVAL_CHANNELS]]
-    raw_crop = raw_raw.copy().pick(raw_eval_picks).crop(tmin=t_start, tmax=min(raw_raw.times[-1], t_stop))
-
+    raw_data_dict, sfreq_raw = _load_raw_eval_channels(raw_vhdr, t_start, t_stop, EVAL_CHANNELS)
     for ch in EVAL_CHANNELS:
-        picks = [c for c in raw_crop.ch_names if c.upper() == ch.upper()]
-        if not picks:
+        data = raw_data_dict.get(ch.upper())
+        if data is None:
             continue
-        data = raw_crop.get_data(picks=picks[:1], units="uV")[0]
         f, psd = psd_for_channel(data, sfreq_raw, NPERSEG_SEC)
         out_dict[f"raw_{ch}_f"] = f
         out_dict[f"raw_{ch}_psd"] = psd
         out_dict[f"raw_{ch}_std"] = float(np.std(data))
-    del raw_raw, raw_crop
-    gc.collect()
+    del raw_data_dict
+    _free_memory()
 
     # 2. Compute Cleaned PSD from EEGLAB .set (only EVAL_CHANNELS)
     print(f"  Loading cleaned EEG: {clean_set.name}")
-    clean_raw = mne.io.read_raw_eeglab(clean_set, preload=False, verbose=False)
-    sfreq_clean = float(clean_raw.info["sfreq"])
-    clean_eval_picks = [ch for ch in clean_raw.ch_names if ch.upper() in [e.upper() for e in EVAL_CHANNELS]]
-    clean_crop = clean_raw.copy().pick(clean_eval_picks)
-
+    clean_data_dict, sfreq_clean = _load_clean_eval_channels(clean_set, EVAL_CHANNELS)
     for ch in EVAL_CHANNELS:
-        picks = [c for c in clean_crop.ch_names if c.upper() == ch.upper()]
-        if not picks:
+        data = clean_data_dict.get(ch.upper())
+        if data is None:
             continue
-        data = clean_crop.get_data(picks=picks[:1], units="uV")[0]
         f, psd = psd_for_channel(data, sfreq_clean, NPERSEG_SEC)
         out_dict[f"clean_{ch}_f"] = f
         out_dict[f"clean_{ch}_psd"] = psd
         out_dict[f"clean_{ch}_std"] = float(np.std(data))
-    del clean_raw, clean_crop
-    gc.collect()
+    del clean_data_dict
+    _free_memory()
 
     # 3. Process EEG21 Reference (Outside MRI) with EO/EC Reactivity
     eeg21_dirs = [segment_dir / "add" / "eeg21", segment_dir / "eeg21"]
@@ -187,7 +259,7 @@ def compute_spectra(segment_dir: Path = DEFAULT_SEGMENT_DIR):
         if edf_files and blocks_files:
             try:
                 print(f"  [INFO] Found EEG21 reference files: {edf_files[0].name}")
-                edf = mne.io.read_raw_edf(str(edf_files[0]), preload=True, verbose=False)
+                edf = mne.io.read_raw_edf(str(edf_files[0]), preload=False, verbose=False)
                 sfreq_edf = float(edf.info["sfreq"])
                 blocks = parse_blocks(blocks_files[0])
                 g1_blocks = [(cap, b, e) for cap, b, e in blocks if cap.startswith("G1.")]  # Eyes Open
@@ -201,10 +273,10 @@ def compute_spectra(segment_dir: Path = DEFAULT_SEGMENT_DIR):
                     # Eyes closed segments
                     ec_segs = []
                     for cap, b_s, e_s in (g2_blocks if g2_blocks else blocks):
-                        s0 = max(0, int(b_s * sfreq_edf))
-                        s1 = min(edf.n_times, int(e_s * sfreq_edf))
+                        s0 = max(0, int(round(b_s * sfreq_edf)))
+                        s1 = min(edf.n_times, int(round(e_s * sfreq_edf)))
                         if s1 > s0:
-                            ec_segs.append(edf.get_data(picks=ch_edf[:1], start=s0, stop=s1, units="uV")[0])
+                            ec_segs.append(edf.get_data(picks=ch_edf[:1], start=s0, stop=s1, units="uV")[0].astype(np.float32))
                     if ec_segs:
                         concat_ec = np.concatenate(ec_segs)
                         f_e, psd_e = psd_for_channel(concat_ec, sfreq_edf, NPERSEG_SEC)
@@ -215,10 +287,10 @@ def compute_spectra(segment_dir: Path = DEFAULT_SEGMENT_DIR):
                     # Eyes open segments for EO/EC ratio
                     eo_segs = []
                     for cap, b_s, e_s in g1_blocks:
-                        s0 = max(0, int(b_s * sfreq_edf))
-                        s1 = min(edf.n_times, int(e_s * sfreq_edf))
+                        s0 = max(0, int(round(b_s * sfreq_edf)))
+                        s1 = min(edf.n_times, int(round(e_s * sfreq_edf)))
                         if s1 > s0:
-                            eo_segs.append(edf.get_data(picks=ch_edf[:1], start=s0, stop=s1, units="uV")[0])
+                            eo_segs.append(edf.get_data(picks=ch_edf[:1], start=s0, stop=s1, units="uV")[0].astype(np.float32))
                     if eo_segs and ec_segs:
                         concat_eo = np.concatenate(eo_segs)
                         f_eo, psd_eo = psd_for_channel(concat_eo, sfreq_edf, NPERSEG_SEC)
@@ -227,7 +299,8 @@ def compute_spectra(segment_dir: Path = DEFAULT_SEGMENT_DIR):
                         p_eo = np.mean(psd_eo[m_a]) if np.any(m_a) else 1e-6
                         eo_ec_data[ch] = float(p_ec / max(p_eo, 1e-12))
 
-                del edf; gc.collect()
+                del edf
+                _free_memory()
                 eeg21_available = True
                 print("  [SUCCESS] EEG21 outside-MRI reference loaded and processed.")
             except Exception as ex:
@@ -368,6 +441,8 @@ def plot_spectra_comparison(data_dict: dict, eeg21_available: bool, segment_dir:
     out_png = segment_dir / "step03_spectra.png"
     fig.savefig(out_png, dpi=150, bbox_inches="tight")
     plt.close(fig)
+    plt.close("all")
+    _free_memory()
     print(f"  Saved full spectra plot: {out_png.name}")
 
 
@@ -422,6 +497,8 @@ def plot_alpha_quality_check(data_dict: dict, eeg21_available: bool, segment_dir
     out_png = segment_dir / "alpha_quality_check.png"
     fig.savefig(out_png, dpi=150, bbox_inches="tight")
     plt.close(fig)
+    plt.close("all")
+    _free_memory()
     print(f"  Saved alpha quality dashboard plot: {out_png.name}")
 
 
@@ -436,6 +513,7 @@ if __name__ == "__main__":
     parser.add_argument("--subject", default=None, help="Subject ID (e.g. 1916)")
     parser.add_argument("--segment", default=None, help="Segment name (e.g. ec, drone) or omit for all segments of subject")
     parser.add_argument("--all", action="store_true", help="Process all available subjects and segments")
+    parser.add_argument("--force", action="store_true", help="Force recomputation even if outputs exist")
     args = parser.parse_args()
 
     seg_dirs: list[Path] = []
@@ -462,4 +540,6 @@ if __name__ == "__main__":
         print("[ERROR] No segments found with segment_work_info.json. Run previous steps first!")
     else:
         for sdir in seg_dirs:
-            compute_spectra(segment_dir=sdir)
+            compute_spectra(segment_dir=sdir, force=args.force)
+            _free_memory()
+

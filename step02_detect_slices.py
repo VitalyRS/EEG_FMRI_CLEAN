@@ -21,11 +21,22 @@ except ImportError:
 
 def run_detect_slices(segment_dir: Path = DEFAULT_SEGMENT_DIR,
                       tr_sec: float = DEFAULT_TR_SEC,
-                      slices_per_volume: int = DEFAULT_SLICES_PER_VOLUME):
+                      slices_per_volume: int = DEFAULT_SLICES_PER_VOLUME,
+                      force: bool = False):
     segment_dir = Path(segment_dir).resolve()
     print("=" * 70)
     print(f"[STEP 02] Detecting slice phase for segment: {segment_dir.name}")
     print("=" * 70)
+
+    slice_json = segment_dir / "slice_detection.json"
+    slice_png = segment_dir / "slice_phase_check.png"
+    if not force and slice_json.exists() and slice_png.exists():
+        print(f"  [SKIP] Slice detection already exists: {slice_json.name} (use --force to recompute)")
+        print("=" * 70)
+        print("  [STEP 02] ALREADY DONE.")
+        print("=" * 70)
+        with open(slice_json, "r", encoding="utf-8") as f:
+            return json.load(f)
 
     # 1. Load segment info (strictly requires step01_detect_mri.py output)
     info_json = segment_dir / "segment_info.json"
@@ -128,6 +139,7 @@ if __name__ == "__main__":
     parser.add_argument("--subject", default=None, help="Subject ID (e.g. 1916)")
     parser.add_argument("--segment", default=None, help="Segment name (e.g. ec, drone) or omit for all segments of subject")
     parser.add_argument("--all", action="store_true", help="Process all available subjects and segments")
+    parser.add_argument("--force", action="store_true", help="Force recomputation even if outputs exist")
     args = parser.parse_args()
 
     seg_dirs: list[Path] = []
@@ -154,4 +166,4 @@ if __name__ == "__main__":
         print("[ERROR] No segments found with segment_info.json. Run step01_detect_mri.py first!")
     else:
         for sdir in seg_dirs:
-            run_detect_slices(sdir)
+            run_detect_slices(sdir, force=args.force)

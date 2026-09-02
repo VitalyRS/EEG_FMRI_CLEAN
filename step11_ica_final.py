@@ -35,13 +35,23 @@ def _find_bcg_fif(segment_dir: Path) -> Path:
     return p
 
 
-def apply_optimized_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR):
+def apply_optimized_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, force: bool = False):
     segment_dir = Path(segment_dir).resolve()
     seg = segment_dir.name
     subject_id = segment_dir.parent.parent.name if segment_dir.parent.name == "segments" else segment_dir.parent.name
     print("=" * 80)
     print(f"[STEP 11] Applying Optimized ICA Parameters to Full Dataset: {subject_id}/{seg}")
     print("=" * 80)
+
+    out_deriv_dir = DATA_ROOT / subject_id / "derivatives" / "05_ica" / seg
+    out_fif = out_deriv_dir / f"{seg}_ica_clean.fif"
+    report_html = out_deriv_dir / f"{seg}_ica_report.html"
+    if not force and out_fif.exists() and report_html.exists():
+        print(f"  [SKIP] Final ICA output already exists: {out_fif.name} (use --force to recompute)")
+        print("=" * 80)
+        print("  [STEP 11] ALREADY DONE.")
+        print("=" * 80)
+        return out_fif
 
     # Load best params from step10 with fallback to standard robust defaults
     params_json = segment_dir / "optuna_ica_best_params.json"
@@ -61,7 +71,8 @@ def apply_optimized_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR):
             "flatline_crit": 5.0,
             "channel_crit": 0.85,
             "line_crit": 4.0,
-            "iclabel_thresh": 0.80  # Conservative: only clear artifacts rejected
+            "iclabel_thresh": 0.80,  # Conservative: only clear artifacts rejected
+            "burst_crit": 20.0       # ASR: gentle burst correction (matches reference asr)
         }
 
     # SAFETY GUARD: clamp Optuna params to prevent over-cleaning.
@@ -75,6 +86,20 @@ def apply_optimized_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR):
     if ch_raw < 0.70:
         print(f"    [GUARD] channel_crit={ch_raw} is unsafe (< 0.70), clamping to 0.80")
         best["channel_crit"] = 0.80
+
+    # ASR burst-correction strength (SD cutoff k). Lower k = more aggressive.
+    # Below 5 ASR starts reconstructing real neural bursts as "artifact" and
+    # flattens the signal, so we clamp to a conservative floor. 'off' disables
+    # ASR entirely (channel removal only, the old behaviour).
+    burst_raw = best.get("burst_crit", 20.0)
+    if isinstance(burst_raw, str) and burst_raw.lower() == "off":
+        burst_crit = "off"
+    else:
+        burst_val = float(burst_raw)
+        if burst_val < 5.0:
+            print(f"    [GUARD] burst_crit={burst_val} is unsafe (< 5), clamping to 20.0")
+            burst_val = 20.0
+        burst_crit = burst_val
 
     for k, v in best.items():
         print(f"    {k:25s} = {v}")
@@ -109,6 +134,10 @@ def apply_optimized_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR):
     channel_crit = best.get("channel_crit", 0.80)
     line_crit = best.get("line_crit", 4.0)
     iclabel_thresh = best.get("iclabel_thresh", 0.70)
+
+    # MATLAB literal for BurstCriterion: 'off' (string) or a bare number.
+    burst_ml = "'off'" if burst_crit == "off" else f"{float(burst_crit)}"
+    print(f"    ASR BurstCriterion = {burst_crit}  (BurstRejection off -> correct, not cut)")
 
     out_mat = work_dir / "result_full.mat"
     m_file = work_dir / "run_final_ica.m"
@@ -157,12 +186,16 @@ orig_chans = {{EEG.chanlocs.labels}};
 n_orig = EEG.nbchan;
 
 fprintf('Running clean_rawdata with optimized parameters...\\n');
+% BurstCriterion enables ASR (matches the reference 'asr' stage). BurstRejection
+% stays 'off' so bad bursts are RECONSTRUCTED in place rather than cut out --
+% this preserves the sample count / duration, exactly like the reference .set.
+% WindowCriterion stays 'off' for the same duration-preservation reason.
 EEG_clean = pop_clean_rawdata(EEG, ...
     'FlatlineCriterion', {flatline_crit}, ...
     'ChannelCriterion', {channel_crit}, ...
     'LineNoiseCriterion', {line_crit}, ...
     'Highpass', 'off', ...
-    'BurstCriterion', 'off', ...
+    'BurstCriterion', {burst_ml}, ...
     'WindowCriterion', 'off', ...
     'BurstRejection', 'off', ...
     'Distance', 'Euclidian');
@@ -489,6 +522,7 @@ if __name__ == "__main__":
     parser.add_argument("--subject", default=None, help="Subject ID (e.g. 1916)")
     parser.add_argument("--segment", default=None, help="Segment name (e.g. ec, drone) or omit for all segments of subject")
     parser.add_argument("--all", action="store_true", help="Process all available subjects and segments")
+    parser.add_argument("--force", action="store_true", help="Force recomputation even if outputs exist")
     args = parser.parse_args()
 
     seg_dirs: list[Path] = []
@@ -515,4 +549,4 @@ if __name__ == "__main__":
         print("[ERROR] No segments found with segment_work_info.json. Run previous steps first!")
     else:
         for sdir in seg_dirs:
-            apply_optimized_ica(sdir)
+            apply_optimized_ica(sdir, force=args.force)

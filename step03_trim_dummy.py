@@ -18,13 +18,33 @@ except ImportError:
 
 
 def trim_dummy_scans(segment_dir: Path = DEFAULT_SEGMENT_DIR,
-                     dummy_volumes: int = DEFAULT_DUMMY_VOLUMES,
+                     dummy_volumes: int = None,
                      tr_sec: float = DEFAULT_TR_SEC,
-                     slices_per_volume: int = DEFAULT_SLICES_PER_VOLUME):
+                     slices_per_volume: int = DEFAULT_SLICES_PER_VOLUME,
+                     force: bool = False):
+    """Trim dummy scans and export slice triggers.
+
+    dummy_volumes:
+      * None (default) -> AUTO: infer the dummy count from the time alignment
+        between the detected segment span and the fMRI task (rp volume count),
+        so the trimmed EEG window matches the task in time. Falls back to
+        DEFAULT_DUMMY_VOLUMES if the detection is too ambiguous.
+      * an int -> FORCE that exact dummy count (manual override, e.g. 13).
+    """
     segment_dir = Path(segment_dir).resolve()
     print("=" * 70)
     print(f"[STEP 03] Generating slice triggers for: {segment_dir.name}")
     print("=" * 70)
+
+    triggers_path = segment_dir / "slice_triggers.txt"
+    work_info_path = segment_dir / "segment_work_info.json"
+    if not force and triggers_path.exists() and work_info_path.exists():
+        print(f"  [SKIP] Slice triggers and work info already exist: {work_info_path.name} (use --force to recompute)")
+        print("=" * 70)
+        print("  [STEP 03] ALREADY DONE.")
+        print("=" * 70)
+        with open(work_info_path, "r", encoding="utf-8") as f:
+            return json.load(f)
 
     # 1. Load slice detection info
     slice_json = segment_dir / "slice_detection.json"
@@ -36,6 +56,7 @@ def trim_dummy_scans(segment_dir: Path = DEFAULT_SEGMENT_DIR,
 
     sfreq = float(det["sfreq"])
     t_start = float(det["t_start_sec"])
+    t_stop = float(det["t_stop_sec"]) if det.get("t_stop_sec") is not None else None
     best_phase = int(det["best_phase_samples"])
     nominal_slice_samples = int(det["nominal_slice_samples"])
     nominal_volume_samples = int(det["nominal_volume_samples"])
@@ -95,6 +116,43 @@ def trim_dummy_scans(segment_dir: Path = DEFAULT_SEGMENT_DIR,
     total_slices = n_work_volumes * slices_per_volume
     work_duration_sec = n_work_volumes * tr_sec
 
+    # --- Determine number of dummy volumes so the EEG work window matches the task ---
+    # The detected segment spans [t_start .. t_stop]. The task (fMRI) is exactly
+    # n_work_volumes * TR long. Everything before it (scanner stabilization) is the
+    # dummy period. So: n_dummy ≈ (detected_span - task_duration) / TR.
+    dummy_auto = dummy_volumes is None
+    dummy_est = None
+    if t_stop is not None:
+        detected_span = t_stop - t_start
+        dummy_est = detected_span / tr_sec - n_work_volumes  # fractional
+    if dummy_auto:
+        if dummy_est is None:
+            dummy_volumes = DEFAULT_DUMMY_VOLUMES
+            print(f"  [DUMMY] No t_stop in detection -> fallback to config default "
+                  f"({DEFAULT_DUMMY_VOLUMES}).")
+        else:
+            n_round = int(round(dummy_est))
+            frac = abs(dummy_est - n_round)
+            if frac > 0.35:
+                # Detection span is ambiguous (lands near a half-volume boundary):
+                # don't trust it, fall back to the configured default.
+                dummy_volumes = DEFAULT_DUMMY_VOLUMES
+                print(f"  [DUMMY] Ambiguous alignment (est={dummy_est:.2f}, "
+                      f"frac={frac:.2f}) -> fallback to config default "
+                      f"({DEFAULT_DUMMY_VOLUMES}). Verify this segment manually.")
+            else:
+                dummy_volumes = max(0, n_round)
+                print(f"  [DUMMY] Auto-detected {dummy_volumes} dummy volume(s) "
+                      f"from time alignment (est={dummy_est:.2f}).")
+    else:
+        # Manual override: honor it, but warn if it clashes with the time alignment.
+        if dummy_est is not None and abs(dummy_est - dummy_volumes) > 0.5:
+            print(f"  [DUMMY] WARNING: forced dummy={dummy_volumes} but time "
+                  f"alignment suggests ~{dummy_est:.2f}. The EEG window may not "
+                  f"match the task by ~{(dummy_est - dummy_volumes) * tr_sec:+.1f}s.")
+        else:
+            print(f"  [DUMMY] Using forced dummy={dummy_volumes} (matches alignment).")
+
     # Start of work interval in continuous recording (1-based sample index for MATLAB)
     raw_start_sample_0idx = int(round(t_start * sfreq)) + best_phase + dummy_volumes * nominal_volume_samples
     raw_stop_sample_0idx  = raw_start_sample_0idx + n_work_volumes * nominal_volume_samples - 1
@@ -124,6 +182,10 @@ def trim_dummy_scans(segment_dir: Path = DEFAULT_SEGMENT_DIR,
         "t_work_stop_sec": float(t_work_stop_sec),
         "sample_start_raw": int(sample_start_1based),
         "sample_stop_raw": int(sample_stop_1based),
+        "dummy_volumes": int(dummy_volumes),
+        "dummy_auto": bool(dummy_auto),
+        "dummy_est": (float(dummy_est) if dummy_est is not None else None),
+        "tr_sec": float(tr_sec),
         "n_work_volumes": int(n_work_volumes),
         "slices_per_volume": int(slices_per_volume),
         "nominal_slice_samples": int(nominal_slice_samples),
@@ -154,6 +216,9 @@ if __name__ == "__main__":
     parser.add_argument("--subject", default=None, help="Subject ID (e.g. 1916)")
     parser.add_argument("--segment", default=None, help="Segment name (e.g. ec, drone) or omit for all segments of subject")
     parser.add_argument("--all", action="store_true", help="Process all available subjects and segments")
+    parser.add_argument("--dummy", type=int, default=None,
+                        help="Force an exact dummy-volume count (e.g. 13). Omit to auto-detect from time alignment.")
+    parser.add_argument("--force", action="store_true", help="Force recomputation even if outputs exist")
     args = parser.parse_args()
 
     seg_dirs: list[Path] = []
@@ -180,4 +245,4 @@ if __name__ == "__main__":
         print("[ERROR] No segments found with slice_detection.json. Run step02_detect_slices.py first!")
     else:
         for sdir in seg_dirs:
-            trim_dummy_scans(sdir)
+            trim_dummy_scans(sdir, dummy_volumes=args.dummy, force=args.force)

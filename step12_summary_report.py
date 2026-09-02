@@ -149,11 +149,17 @@ def _stage_block(idx, title, op_desc, img_b64, param_pairs, metric_pairs, verdic
 # --------------------------------------------------------------------------- #
 #  Основная сборка
 # --------------------------------------------------------------------------- #
-def generate_summary_report(segment_dir: Path = DEFAULT_SEGMENT_DIR):
+def generate_summary_report(segment_dir: Path = DEFAULT_SEGMENT_DIR, force: bool = False):
     segment_dir = Path(segment_dir).resolve()
     seg = segment_dir.name                      # 'ec', 'drone', etc.
     subject = segment_dir.parent.parent.name if segment_dir.parent.name == "segments" else segment_dir.parent.name
     deriv = DATA_ROOT / subject / "derivatives"
+
+    out_dir = PROJECT_ROOT / "reports" / subject / seg
+    out_html = out_dir / f"report_{subject}_{seg}.html"
+    if not force and out_html.exists():
+        print(f"  [SKIP] Summary report already exists: {out_html.name} (use --force to recompute)")
+        return out_html
 
     print(f"[STEP 12] Сборка сводного отчёта для {subject}/{seg} ...")
 
@@ -164,6 +170,7 @@ def generate_summary_report(segment_dir: Path = DEFAULT_SEGMENT_DIR):
     fif_ica   = deriv / "05_ica"          / seg / f"{seg}_ica_clean.fif"
 
     bergen_params = _load_json(segment_dir / "optuna_best_params.json") or {}
+    work_info     = _load_json(segment_dir / "segment_work_info.json") or {}
     bcg_metrics   = _load_json(deriv / "03_bcg" / seg / f"{seg}_bcg_metrics.json") or {}
     ica_metrics   = _load_json(deriv / "05_ica" / seg / f"{seg}_ica_metrics.json") or {}
     ica_best      = _load_json(segment_dir / "ica_optuna_best.json") or {}
@@ -182,12 +189,28 @@ def generate_summary_report(segment_dir: Path = DEFAULT_SEGMENT_DIR):
         b_img = _overlay_plot(before, after, "raw (сырой в сканере)", "Bergen AAS",
                               "Этап 1 — Bergen")
     bp = bergen_params.get("best_params", {})
+    n_dummy = work_info.get("dummy_volumes")
+    tr = work_info.get("tr_sec")
+    if n_dummy is not None:
+        dummy_str = f"{n_dummy}" + (f" ({n_dummy * tr:.1f} с)" if tr else "")
+        mode = "авто" if work_info.get("dummy_auto") else "вручную"
+        dummy_str += f" · {mode}"
+        est = work_info.get("dummy_est")
+        if est is not None:
+            # residual mismatch between EEG window and task after trimming n_dummy
+            resid = (est - n_dummy) * (tr or 2.5)
+            dummy_str += f" · рассинхрон с задачей {resid:+.1f} с"
+    else:
+        dummy_str = "—"
+    n_work = work_info.get("n_work_volumes", "—")
     stages_html.append(_stage_block(
         1, "Bergen AAS — удаление градиентного артефакта МРТ",
         "Шаблонное вычитание артефакта переключения градиентов (Average Artifact "
         "Subtraction). Параметры подобраны Optuna по сохранению alpha-пика в затылочных каналах.",
         b_img,
-        [("shift (сдвиг шаблона)", bp.get("shift", "—")),
+        [("Dummy-объёмов срезано", dummy_str),
+         ("Рабочих объёмов (fMRI)", n_work),
+         ("shift (сдвиг шаблона)", bp.get("shift", "—")),
          ("win_k (окно усреднения)", bp.get("win_k", "—")),
          ("motion_thresh", bp.get("motion_thresh", "—")),
          ("best_trial", bergen_params.get("best_trial", "—"))],
@@ -332,6 +355,7 @@ if __name__ == "__main__":
     parser.add_argument("--subject", default=None, help="Subject ID (e.g. 1916)")
     parser.add_argument("--segment", default=None, help="Segment name (e.g. ec, drone) or omit for all segments of subject")
     parser.add_argument("--all", action="store_true", help="Process all available subjects and segments")
+    parser.add_argument("--force", action="store_true", help="Force recomputation even if report exists")
     args = parser.parse_args()
 
     seg_dirs: list[Path] = []
@@ -358,4 +382,4 @@ if __name__ == "__main__":
         print("[ERROR] No segments found with segment_work_info.json. Run previous steps first!")
     else:
         for sdir in seg_dirs:
-            generate_summary_report(sdir)
+            generate_summary_report(sdir, force=args.force)

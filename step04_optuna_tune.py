@@ -240,11 +240,22 @@ def run_single_channel_matlab(segment_dir: Path, mat_1ch_path: Path, triggers_pa
 
 def run_optuna_tuning(segment_dir: Path = DEFAULT_SEGMENT_DIR,
                       n_trials: int = DEFAULT_N_TRIALS,
-                      target_ch: str = DEFAULT_TARGET_CH):
+                      target_ch: str = DEFAULT_TARGET_CH,
+                      force: bool = False):
     segment_dir = Path(segment_dir).resolve()
     print("=" * 70)
     print(f"[STEP 04] Optuna TPE Optimization (Lean 1-Channel) for: {segment_dir.name}")
     print("=" * 70)
+
+    params_json = segment_dir / "optuna_best_params.json"
+    out_png = segment_dir / "optuna_result.png"
+    if not force and params_json.exists() and out_png.exists():
+        print(f"  [SKIP] Optuna Bergen parameters already exist: {params_json.name} (use --force to recompute)")
+        print("=" * 70)
+        print("  [STEP 04] ALREADY DONE.")
+        print("=" * 70)
+        with open(params_json, "r", encoding="utf-8") as f:
+            return json.load(f)
 
     work_info_path = segment_dir / "segment_work_info.json"
     if not work_info_path.exists():
@@ -435,6 +446,7 @@ if __name__ == "__main__":
     parser.add_argument("--segment", default=None, help="Segment name (e.g. ec, drone) or omit for all segments of subject")
     parser.add_argument("--n-trials", type=int, default=DEFAULT_N_TRIALS, help=f"Number of Optuna trials (default: {DEFAULT_N_TRIALS})")
     parser.add_argument("--all", action="store_true", help="Process all available subjects and segments")
+    parser.add_argument("--force", action="store_true", help="Force recomputation even if outputs exist")
     args = parser.parse_args()
 
     seg_dirs: list[Path] = []
@@ -461,4 +473,4 @@ if __name__ == "__main__":
         print("[ERROR] No segments found with segment_work_info.json. Run step03_trim_dummy.py first!")
     else:
         for sdir in seg_dirs:
-            run_optuna_tuning(segment_dir=sdir, n_trials=args.n_trials)
+            run_optuna_tuning(segment_dir=sdir, n_trials=args.n_trials, force=args.force)
