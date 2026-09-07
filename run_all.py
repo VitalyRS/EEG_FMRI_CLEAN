@@ -120,8 +120,8 @@ def clean_all_derivatives(seg_dir: Path):
     #    under data/<subject>/raw/, and are never touched).
     if seg_dir.exists():
         patterns = [
-            # step01-03 computed metadata (these are the skip-markers for 01-03)
-            "segment_info.json", "slice_detection.json", "segment_work_info.json",
+            # step02-03 computed metadata (step01 segment_info.json is preserved)
+            "slice_detection.json", "segment_work_info.json",
             "slice_triggers.txt", "slice_phase_check.png",
             # step04 Optuna Bergen: study DB, trials, best params
             "*.db", "*optuna*", "trial*", "*_best_params.json",
@@ -156,7 +156,7 @@ def clean_all_derivatives(seg_dir: Path):
 
 # Canonical processing order for named segments. Segments not listed here are
 # appended afterwards in alphabetical order, so unknown names still get run.
-SEGMENT_ORDER = ["eo", "ec", "drone", "lasertag", "video"]
+SEGMENT_ORDER = ["ec", "eo", "drone", "lasertag", "video"]
 
 
 def _order_segments(dirs):

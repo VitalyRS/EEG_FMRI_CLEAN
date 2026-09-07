@@ -64,7 +64,8 @@ FMRI_ROOT = Path(os.getenv(
 # ---------------------------------------------------------------------------
 DETECTION_CHANNELS = ["Fp1", "Fp2", "Fz", "Cz", "Pz"]
 WINDOW_SEC         = 0.20     # RMS window width (seconds)
-MIN_SEGMENT_SEC    = 25.0     # discard segments shorter than this
+MIN_SEGMENT_SEC    = 25.0     # discard segments shorter than this (raw detection)
+MIN_NAMED_SEC      = 250.0    # skip named-segment assignment for segments shorter than this
 MERGE_GAP_SEC      = 1.0      # merge gaps smaller than this
 AUTO_THRESHOLD     = False    # True → auto percentile, False → manual
 MANUAL_THRESHOLD   = 300.0    # µV  (used when AUTO_THRESHOLD is False)
@@ -142,21 +143,33 @@ def discover_all_eeg_vhdrs() -> dict[str, Path]:
 # rp helpers
 # ---------------------------------------------------------------------------
 
-def find_rp_file(subject_id: str, suffix: str) -> Path | None:
-    """Locate rp_*_<suffix>_*.txt in FMRI_ROOT/<subject_id>FMRI/."""
+def find_all_rp_files(subject_id: str) -> list[Path]:
+    """
+    Return all rp_*.txt files for the subject, sorted by their numeric series
+    suffix (the first 3-digit number found in the filename) in ascending order.
+    Checks FMRI_ROOT/<subject_id>FMRI/ first, then local data/<subject_id>/raw/rp_spm/.
+    """
+    candidates: list[tuple[int, Path]] = []
+
     fmri_dir = FMRI_ROOT / f"{subject_id}FMRI"
-    if not fmri_dir.exists():
-        # Also check local rp_spm dir if any
+    if fmri_dir.exists():
+        for f in fmri_dir.glob("rp_*.txt"):
+            m = _RP_SUFFIX_RE.search(f.name)
+            if m:
+                candidates.append((int(m.group(1)), f))
+
+    # Fall back to local rp_spm directory
+    if not candidates:
         local_rp = DATA_ROOT / subject_id / "raw" / "rp_spm"
         if local_rp.exists():
-            for f in sorted(local_rp.glob(f"*{suffix}*.txt")):
-                return f
-        return None
-    for f in sorted(fmri_dir.glob("rp_*.txt")):
-        m = _RP_SUFFIX_RE.search(f.name)
-        if m and m.group(1) == suffix:
-            return f
-    return None
+            for f in local_rp.glob("*.txt"):
+                m = _RP_SUFFIX_RE.search(f.name)
+                if m:
+                    candidates.append((int(m.group(1)), f))
+
+    # Sort by numeric suffix ascending → positional assignment
+    candidates.sort(key=lambda x: x[0])
+    return [p for _, p in candidates]
 
 
 def get_rp_n_volumes(rp_path: Path) -> int:
@@ -173,7 +186,7 @@ def _build_plot(times: np.ndarray,
                 rms_smooth: np.ndarray,
                 threshold: float,
                 merged: list[list[float]],
-                named_start: int,
+                result: list[dict],
                 subject_id: str) -> str:
     """
     Build an RMS-envelope figure and return it as a base-64 PNG string.
@@ -194,7 +207,7 @@ def _build_plot(times: np.ndarray,
 
     legend_handles: list = []
 
-    # Skipped segment (first)
+    # Skipped segment (first calibration)
     if merged:
         t0, t1 = merged[0]
         ax.axvspan(t0, t1, alpha=0.18, color=SEG_COLORS["_skip"], linewidth=0)
@@ -208,28 +221,39 @@ def _build_plot(times: np.ndarray,
                           ec=SEG_COLORS["_skip"], lw=0.8, alpha=0.9))
         legend_handles.append(
             mpatches.Patch(color=SEG_COLORS["_skip"], alpha=0.5,
-                           label="Segment 1 (skipped)"))
+                           label="Skipped / short"))
 
-    # Named segments
+    # Named and other segments
     seen: set[str] = set()
-    for rank, (t0, t1) in enumerate(merged[named_start:]):
-        if rank >= len(SESSION_ORDER):
-            break
-        name  = SESSION_ORDER[rank]
-        color = SEG_COLORS.get(name, "#888888")
-        ax.axvspan(t0, t1, alpha=0.22, color=color, linewidth=0)
-        ax.axvline(t0, color=color, lw=1.1, alpha=0.8, ls="--")
-        ax.axvline(t1, color=color, lw=1.1, alpha=0.8, ls="--")
-        mid = (t0 + t1) / 2
-        ax.text(mid, ylim_top * 0.95, name,
-                ha="center", va="top", fontsize=8.5, color=color,
-                fontweight="bold",
-                bbox=dict(boxstyle="round,pad=0.25", fc="#1a1a2e",
-                          ec=color, lw=0.9, alpha=0.9))
-        if name not in seen:
-            legend_handles.append(
-                mpatches.Patch(color=color, alpha=0.6, label=name))
-            seen.add(name)
+    for idx, (t0, t1) in enumerate(merged[1:], 2):
+        matched_r = next((r for r in result if abs(r["t_start_sec"] - t0) < 1.0), None)
+        if matched_r:
+            name  = matched_r["name"]
+            color = SEG_COLORS.get(name, "#888888")
+            ax.axvspan(t0, t1, alpha=0.22, color=color, linewidth=0)
+            ax.axvline(t0, color=color, lw=1.1, alpha=0.8, ls="--")
+            ax.axvline(t1, color=color, lw=1.1, alpha=0.8, ls="--")
+            mid = (t0 + t1) / 2
+            ax.text(mid, ylim_top * 0.95, name,
+                    ha="center", va="top", fontsize=8.5, color=color,
+                    fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.25", fc="#1a1a2e",
+                              ec=color, lw=0.9, alpha=0.9))
+            if name not in seen:
+                legend_handles.append(
+                    mpatches.Patch(color=color, alpha=0.6, label=name))
+                seen.add(name)
+        else:
+            # Segment was skipped (e.g. dur < MIN_NAMED_SEC)
+            ax.axvspan(t0, t1, alpha=0.15, color=SEG_COLORS["_skip"], linewidth=0)
+            ax.axvline(t0, color=SEG_COLORS["_skip"], lw=0.8, alpha=0.5, ls=":")
+            ax.axvline(t1, color=SEG_COLORS["_skip"], lw=0.8, alpha=0.5, ls=":")
+            mid = (t0 + t1) / 2
+            ax.text(mid, ylim_top * 0.95, "SKIP\n(short)",
+                    ha="center", va="top", fontsize=6.5, color=SEG_COLORS["_skip"],
+                    fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="#1a1a2e",
+                              ec=SEG_COLORS["_skip"], lw=0.8, alpha=0.9))
 
     ax.set_xlabel("Time (s)", color="#cccccc", fontsize=10)
     ax.set_ylabel("RMS  [µV]", color="#cccccc", fontsize=10)
@@ -328,18 +352,17 @@ def _build_html(subject_id: str,
                 f"<td class='skip'>—</td><td class='skip'>—</td>"
                 f"<td class='skip'>—</td></tr>")
         else:
-            rank = idx - 2
-            if rank < len(result):
-                r = result[rank]
-                name   = r["name"]
+            matched_r = next((r for r in result if abs(r["t_start_sec"] - t0) < 1.0), None)
+            if matched_r:
+                name   = matched_r["name"]
                 color  = SEG_COLORS.get(name, "#888")
                 badge  = (f"<span class='badge' "
                           f"style='background:{color}25;border-color:{color}'>"
                           f"{name}</span>")
-                rp_v   = r["rp_n_volumes"] or "—"
-                rp_d   = f"{r['rp_duration_sec']:.0f}" if r["rp_duration_sec"] else "—"
-                diff   = (abs(dur - (r["rp_duration_sec"] + DUMMY_DUR_SEC))
-                          if r["rp_duration_sec"] else None)
+                rp_v   = matched_r["rp_n_volumes"] or "—"
+                rp_d   = f"{matched_r['rp_duration_sec']:.0f}" if matched_r["rp_duration_sec"] else "—"
+                diff   = (abs(dur - (matched_r["rp_duration_sec"] + DUMMY_DUR_SEC))
+                          if matched_r["rp_duration_sec"] else None)
                 match_cls = "ok" if (diff is not None and diff < 5) else "warn"
                 match_str = (f"Δ{diff:.0f}s" if diff is not None else "n/a")
                 all_rows.append(
@@ -348,10 +371,12 @@ def _build_html(subject_id: str,
                     f"<td class='ctr'>{rp_v}</td><td class='ctr'>{rp_d}</td>"
                     f"<td class='ctr {match_cls}'>{match_str}</td></tr>")
             else:
+                skip_reason = f"SKIP (dur {dur:.1f}s < {MIN_NAMED_SEC:.0f}s)" if dur < MIN_NAMED_SEC else "SKIP (extra)"
                 all_rows.append(
-                    f"<tr><td>{idx}</td><td>—</td>"
+                    f"<tr><td>{idx}</td><td class='skip'>{skip_reason}</td>"
                     f"<td>{t0:.2f}</td><td>{t1:.2f}</td><td>{dur:.1f}</td>"
-                    f"<td>—</td><td>—</td><td>—</td></tr>")
+                    f"<td class='skip'>—</td><td class='skip'>—</td>"
+                    f"<td class='skip'>—</td></tr>")
 
     seg_table = "\n".join(all_rows)
 
@@ -448,6 +473,41 @@ Total Named Sessions: <b>{total_sessions}</b></p>
 <footer>step01_detect_mri.py — EEG-fMRI Clean Pipeline</footer>
 </body>
 </html>"""
+
+
+def update_all_subjects_summary_report() -> Path:
+    """Scan data/<sid>/segments/ for all subjects and rebuild all_subjects_report.html."""
+    all_results: dict[str, list[dict]] = {}
+    if DATA_ROOT.exists():
+        for sdir in sorted(DATA_ROOT.iterdir()):
+            if not sdir.is_dir():
+                continue
+            sid = sdir.name
+            seg_dir = sdir / "segments"
+            if not seg_dir.exists():
+                continue
+            subj_segs = []
+            for name in SESSION_ORDER:
+                s_info = seg_dir / name / "segment_info.json"
+                if s_info.exists():
+                    try:
+                        with open(s_info, "r", encoding="utf-8") as f:
+                            subj_segs.append(json.load(f))
+                    except Exception:
+                        pass
+            if subj_segs:
+                all_results[sid] = subj_segs
+
+    if all_results:
+        generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+        summary_html = build_summary_html(all_results, generated_at)
+        REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        summary_path = REPORT_DIR / "all_subjects_report.html"
+        summary_path.write_text(summary_html, encoding="utf-8")
+        print(f"[STEP 01] Multi-Subject Summary Report updated: file://{summary_path.resolve()}")
+        return summary_path
+    return None
+
 
 
 # ---------------------------------------------------------------------------
@@ -559,14 +619,28 @@ def detect_mri_sessions(vhdr_path: Path = None,
         print(f"  Segment {idx}: [{t0:.2f}s – {t1:.2f}s]  dur={t1-t0:.1f}s{mark}")
 
     # --------------------------------------------------------- Assign names
-    named_segments = merged[1:]   # drop first calibration segment
+    # Drop first calibration segment, then filter out any segment shorter
+    # than MIN_NAMED_SEC (e.g. aborted runs, artefact bursts).
+    candidates = merged[1:]   # drop first calibration segment
+    named_segments = []
+    named_indices = []
+    for idx, (t0, t1) in enumerate(candidates, 2):
+        dur = t1 - t0
+        if dur < MIN_NAMED_SEC:
+            print(f"  [INFO] Segment [{t0:.2f}s – {t1:.2f}s] dur={dur:.1f}s < "
+                  f"{MIN_NAMED_SEC:.0f}s → skipped (too short for a named session)")
+        else:
+            named_segments.append([t0, t1])
+            named_indices.append(idx)
+
     if len(named_segments) > len(SESSION_ORDER):
         print(f"\n[WARN] {len(named_segments)} segments after skip but only "
               f"{len(SESSION_ORDER)} session names defined — extras ignored.")
         named_segments = named_segments[:len(SESSION_ORDER)]
+        named_indices = named_indices[:len(SESSION_ORDER)]
     elif len(named_segments) < len(SESSION_ORDER):
         print(f"\n[WARN] Only {len(named_segments)} segments after skip "
-              f"(expected {len(SESSION_ORDER)}).")
+              f"(expected {len(SESSION_ORDER)}).")  
 
     print(f"\n{'Segment':<10} {'Name':<12} {'Start(s)':>9} {'Stop(s)':>9} "
           f"{'RMS dur':>8} {'rp vols':>8} {'rp dur':>8} {'Match':>6}")
@@ -575,12 +649,31 @@ def detect_mri_sessions(vhdr_path: Path = None,
     result: list[dict] = []
     dur_lines: list[str] = []
 
+    # Collect all rp files sorted by numeric suffix (ascending) and assign positionally
+    all_rp_files = find_all_rp_files(subject_id)
+    print(f"  [INFO] Found {len(all_rp_files)} rp file(s) for subject {subject_id} "
+          f"(sorted by series number):")
+    for rp in all_rp_files:
+        m = _RP_SUFFIX_RE.search(rp.name)
+        print(f"    {m.group(1) if m else '???'}  →  {rp.name}")
+
+    if len(all_rp_files) < len(named_segments):
+        print(f"  [WARN] Only {len(all_rp_files)} rp file(s) found, "
+              f"but {len(named_segments)} named segment(s) — some sessions will have no rp.")
+
     for rank, (t0, t1) in enumerate(named_segments):
         name    = SESSION_ORDER[rank]
-        suffix  = SESSION_SUFFIX[name]
         dur_rms = t1 - t0
+        actual_seg_idx = named_indices[rank]
 
-        rp_path   = find_rp_file(subject_id, suffix)
+        rp_path = all_rp_files[rank] if rank < len(all_rp_files) else None
+        # Extract actual suffix from matched file (for segment_info.json)
+        suffix = SESSION_SUFFIX[name]   # default
+        if rp_path:
+            m = _RP_SUFFIX_RE.search(rp_path.name)
+            if m:
+                suffix = m.group(1)
+
         rp_vols   = None
         rp_dur    = None
         match_str = "n/a"
@@ -591,19 +684,19 @@ def detect_mri_sessions(vhdr_path: Path = None,
             diff      = abs(dur_rms - expected)
             match_str = f"Δ{diff:.0f}s"
         else:
-            print(f"  [WARNING] Missing SPM rp file for session '{name}' (suffix {suffix}) in {FMRI_ROOT}/{subject_id}FMRI!")
+            print(f"  [WARNING] No rp file for session '{name}' (position {rank+1}).")
 
         seg_folder = segments_dir / name
         seg_folder.mkdir(exist_ok=True)
 
-        print(f"  {rank+2:<8} {name:<12} {t0:>9.2f} {t1:>9.2f} "
+        print(f"  {actual_seg_idx:<8} {name:<12} {t0:>9.2f} {t1:>9.2f} "
               f"{dur_rms:>8.1f} "
               f"{rp_vols if rp_vols else '—':>8} "
               f"{rp_dur if rp_dur else '—':>8} "
               f"{match_str:>6}")
 
         seg_info = {
-            "segment_idx":     rank + 2,
+            "segment_idx":     actual_seg_idx,
             "name":            name,
             "session_suffix":  suffix,
             "t_start_sec":     float(t0),
@@ -621,7 +714,7 @@ def detect_mri_sessions(vhdr_path: Path = None,
         with open(seg_folder / "segment_info.json", "w", encoding="utf-8") as f:
             json.dump(seg_info, f, indent=2)
 
-        dur_lines.append(f"{name} (segment {rank+2}): "
+        dur_lines.append(f"{name} (segment {actual_seg_idx}): "
                          f"[{t0:.2f}s – {t1:.2f}s]  dur={dur_rms:.1f}s")
         result.append(seg_info)
 
@@ -635,7 +728,7 @@ def detect_mri_sessions(vhdr_path: Path = None,
         print(f"[STEP 01] Generating HTML report for {subject_id} …", flush=True)
         plot_b64 = _build_plot(
             times_win, rms_values, rms_smooth,
-            threshold, merged, named_start=1,
+            threshold, merged, result,
             subject_id=subject_id)
 
         generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -693,16 +786,8 @@ def main() -> None:
         res = detect_mri_sessions(vhdr_path=vhdr, subject_id=sid, write_report=True)
         all_results[sid] = res
 
-    # Generate summary report if multiple subjects
-    if len(all_results) > 1:
-        generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
-        summary_html = build_summary_html(all_results, generated_at)
-        REPORT_DIR.mkdir(parents=True, exist_ok=True)
-        summary_path = REPORT_DIR / "all_subjects_report.html"
-        summary_path.write_text(summary_html, encoding="utf-8")
-        print("\n" + "=" * 80)
-        print(f"[STEP 01] Multi-Subject Summary Report: file://{summary_path.resolve()}")
-        print("=" * 80)
+    # Always update the all-subjects summary report
+    update_all_subjects_summary_report()
 
 
 if __name__ == "__main__":

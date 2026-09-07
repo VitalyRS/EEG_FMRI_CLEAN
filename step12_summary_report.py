@@ -148,6 +148,7 @@ def _stage_block(idx, title, op_desc, img_b64, param_pairs, metric_pairs, verdic
 
 # --------------------------------------------------------------------------- #
 #  Основная сборка
+
 # --------------------------------------------------------------------------- #
 def generate_summary_report(segment_dir: Path = DEFAULT_SEGMENT_DIR, force: bool = False):
     segment_dir = Path(segment_dir).resolve()
