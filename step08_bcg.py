@@ -42,47 +42,22 @@ import mne
 
 try:
     from .config import (PROJECT_ROOT, DATA_ROOT, DEFAULT_EXPERIMENT, MATLAB_BIN,
-                         EEGLAB_DIR, DEFAULT_SEGMENT_DIR, ALPHA_BAND, EVAL_CHANNELS)
+                         EEGLAB_DIR, DEFAULT_SEGMENT_DIR, ALPHA_BAND, EVAL_CHANNELS,
+                         TARGET_SFREQ, FILTER_HP, FILTER_LP, BCG_ALPHA_GATE_MIN)
 except ImportError:
     from config import (PROJECT_ROOT, DATA_ROOT, DEFAULT_EXPERIMENT, MATLAB_BIN,
-                        EEGLAB_DIR, DEFAULT_SEGMENT_DIR, ALPHA_BAND, EVAL_CHANNELS)
+                        EEGLAB_DIR, DEFAULT_SEGMENT_DIR, ALPHA_BAND, EVAL_CHANNELS,
+                        TARGET_SFREQ, FILTER_HP, FILTER_LP, BCG_ALPHA_GATE_MIN)
 
-TARGET_SFREQ = 250.0          # Hz after resampling (Nyquist = 125 Hz)
 ECG_CH       = "ECG"          # name of cardiac channel in the .set
 CARDIAC_BAND = (0.7, 4.0)     # Hz - fundamental + harmonics of BCG
 NPC_GRID     = [1, 2, 3, 4, 5, 6, 7, 8]   # OBS basis components to sweep (incl. gentle 1-2)
 FMRIB_DIR    = EEGLAB_DIR / "plugins" / "fMRIb2.1"
 
-# Band-pass applied AFTER resampling and BEFORE BCG. The band is matched to the
-# reference .set pipeline (LPF_80 + SR_250 -> 0.25-80 Hz) so our FIF output lands
-# in the same spectral window as the colleague's EEGLAB output.
-#
-#   High-pass 1.0 Hz: standard for EEG-fMRI, removes slow drift (0.5-1 Hz
-#   respiration/movement) that creates baseline wander in time-domain plots.
-#   The reference .set likely uses 1.0 Hz or higher, which is why their time
-#   traces are flat. 0.5 Hz was too gentle and left visible drift. The 1-80 Hz
-#   band is the de facto standard for cleaned EEG-fMRI analysis.
-#
-#   Low-pass 80 Hz: matches the reference LPF_80 and keeps low/mid gamma. It sits
-#   45 Hz below the 125 Hz Nyquist of the 250 Hz data, so the transition band is
-#   clean. TRADE-OFF: the old 45 Hz cut removed the 44-100 Hz MRI helium-pump
-#   vibration comb; at 80 Hz the 44-80 Hz portion of that comb is back in-band.
-#   We now rely on the downstream ASR + ICA (muscle/line) stages to suppress it,
-#   which is exactly how the reference pipeline handles it (asr + ica_musle).
-FILTER_HP = 1.0               # Hz high-pass  (was 0.5; raised to 1.0 to remove slow drift)
-FILTER_LP = 80.0              # Hz low-pass   (was 45.0; raised to match reference LPF_80)
-
 # npc SELECTION POLICY (OBS -> ICA architecture):
-# BCG is NOT required to be surgically alpha-preserving here. Its job is to
-# remove the bulk of the pulse artifact; the fine "alpha vs BCG residual"
-# separation is left to the later ICA / ICLabel stage. So we pick npc by
-# strongest cardiac suppression. Alpha retention is reported as a diagnostic
-# only (it cannot cleanly distinguish "ate the rhythm" from "removed BCG power
-# that overlapped the 8-13 Hz band"), and is used just to warn, not to gate.
 ALPHA_WARN_MIN = 0.60   # below this, flag REVIEW for a human/QC glance
-ALPHA_GATE_MIN = 0.75   # npc selection: pick strongest cardiac suppression
-                        # among npc whose alpha retention stays >= this gate.
-                        # BCG is deliberately conservative; ICA cleans the rest.
+ALPHA_GATE_MIN = BCG_ALPHA_GATE_MIN
+
 
 # Channels used to SCORE each npc. Must be the SAME set used for the final
 # metric, otherwise the sweep is biased. Frontal channels have the strongest
@@ -170,18 +145,16 @@ def run_fmrib_bcg_matlab(data_all: np.ndarray, ch_names: list[str], ecg_idx: int
     work_dir.mkdir(parents=True, exist_ok=True)
     in_mat = work_dir / "bcg_input.mat"
     qrs_mat = work_dir / "bcg_qrs.mat"
-    m_file = work_dir / "bcg_fmrib.m"
-
+    
     sio.savemat(in_mat, {
         "data": data_all.astype(np.float32),
         "srate": float(sfreq),
         "labels": np.array(ch_names, dtype=object),
     }, do_compression=True)
 
-    npc_list_ml = "[" + " ".join(str(n) for n in npc_grid) + "]"
     out_pattern = str(work_dir / "bcg_npc")   # -> bcg_npc%d.mat
 
-    lines = [
+    base_ml = [
         f"addpath('{EEGLAB_DIR.resolve()}');",
         f"addpath('{FMRIB_DIR.resolve()}');",
         "eeglab nogui;",
@@ -202,55 +175,77 @@ def run_fmrib_bcg_matlab(data_all: np.ndarray, ch_names: list[str], ecg_idx: int
         "    EEG.chanlocs(i).labels = deblank(S.labels(i,:));",
         "  end",
         "end",
-        "EEG = eeg_checkset(EEG);",
-        f"ecgchan = {ecg_idx + 1};",   # 1-based for MATLAB
+        "EEG = eeg_checkset(EEG);"
+    ]
+
+    # --- Step 1: Detect QRS and save ---
+    m_qrs = work_dir / "run_qrs.m"
+    lines_qrs = base_ml + [
+        f"ecgchan = {ecg_idx + 1};",
         "fprintf('Detecting QRS on channel %d...\\n', ecgchan);",
         "EEG = pop_fmrib_qrsdetect(EEG, ecgchan, 'qrs', 'no');",
         "qrs_lat = [];",
         "for i = 1:length(EEG.event)",
         "  if strcmp(EEG.event(i).type, 'qrs')",
-        "    qrs_lat(end+1) = EEG.event(i).latency;",   # 1-based sample latency
+        "    qrs_lat(end+1) = EEG.event(i).latency;",
         "  end",
         "end",
         f"save('{qrs_mat.resolve()}', 'qrs_lat', '-v7');",
         "fprintf('QRS events: %d\\n', numel(qrs_lat));",
-        f"npc_list = {npc_list_ml};",
-        "for k = 1:numel(npc_list)",
-        "  npc = npc_list(k);",
-        "  fprintf('OBS with npc=%d...\\n', npc);",
-        "  EEGc = pop_fmrib_pas(EEG, 'qrs', 'obs', npc);",
-        "  clean = single(EEGc.data);",
-        f"  fname = sprintf('{out_pattern}%d.mat', npc);",
-        "  save(fname, 'clean', '-v7');",
-        "  clear EEGc clean;",
-        "end",
-        "exit(0);",
+        "exit(0);"
     ]
-    m_file.write_text("\n".join(lines) + "\n", encoding="ascii")
-
-    print(f"  Launching MATLAB fMRIB (QRS + OBS sweep npc={npc_grid})...")
+    m_qrs.write_text("\n".join(lines_qrs) + "\n", encoding="ascii")
+    
+    print(f"  Launching MATLAB fMRIB (QRS detection)...")
     res = subprocess.run(
-        [str(MATLAB_BIN), "-nodesktop", "-nosplash", "-batch", f"run('{m_file.resolve()}')"],
+        [str(MATLAB_BIN), "-nodesktop", "-nosplash", "-batch", f"run('{m_qrs.resolve()}')"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
     )
     if res.returncode != 0:
         tail = "\n".join(res.stdout.splitlines()[-30:])
-        raise RuntimeError(f"MATLAB fMRIB failed (code {res.returncode}):\n{tail}")
-
+        raise RuntimeError(f"MATLAB fMRIB QRS failed (code {res.returncode}):\n{tail}")
     if not qrs_mat.exists():
         raise RuntimeError("MATLAB did not produce QRS output.")
+        
     qrs = np.array(sio.loadmat(qrs_mat)["qrs_lat"], dtype=float).flatten()
     qrs = np.round(qrs).astype(int) - 1        # 1-based -> 0-based
     qrs = qrs[(qrs >= 0) & (qrs < data_all.shape[1])]
 
+    # --- Step 2: Loop over npc in separate MATLAB sessions ---
     cleaned_paths = {}
     for npc in npc_grid:
-        p = work_dir / f"bcg_npc{npc}.mat"
-        if p.exists():
-            cleaned_paths[npc] = p
+        m_obs = work_dir / f"run_obs_{npc}.m"
+        fname = f"{out_pattern}{npc}.mat"
+        lines_obs = base_ml + [
+            f"load('{qrs_mat.resolve()}', 'qrs_lat');",
+            "for i = 1:length(qrs_lat)",
+            "  EEG.event(end+1).type = 'qrs';",
+            "  EEG.event(end).latency = qrs_lat(i);",
+            "end",
+            "EEG = eeg_checkset(EEG);",
+            f"fprintf('OBS with npc={npc}...\\n');",
+            f"EEGc = pop_fmrib_pas(EEG, 'qrs', 'obs', {npc});",
+            "clean = single(EEGc.data);",
+            f"save('{fname}', 'clean', '-v7');",
+            "exit(0);"
+        ]
+        m_obs.write_text("\n".join(lines_obs) + "\n", encoding="ascii")
+        print(f"    Launching MATLAB fMRIB OBS (npc={npc})...")
+        res = subprocess.run(
+            [str(MATLAB_BIN), "-nodesktop", "-nosplash", "-batch", f"run('{m_obs.resolve()}')"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        if res.returncode != 0:
+            tail = "\n".join(res.stdout.splitlines()[-30:])
+            print(f"      [WARN] MATLAB fMRIB OBS failed for npc={npc}:\n{tail}")
+        else:
+            p = Path(fname)
+            if p.exists():
+                cleaned_paths[npc] = p
+        m_obs.unlink(missing_ok=True)
 
     in_mat.unlink(missing_ok=True)
-    m_file.unlink(missing_ok=True)
+    m_qrs.unlink(missing_ok=True)
     qrs_mat.unlink(missing_ok=True)
     return qrs, cleaned_paths
 
@@ -468,7 +463,10 @@ def generate_bcg_html(seg_name, metrics, best_npc, per_channel, sfreq_before,
 # Main orchestration
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_bcg_pipeline(segment_dir: Path = DEFAULT_SEGMENT_DIR, npc_grid=None, force: bool = False):
+def run_bcg_pipeline(segment_dir: Path = DEFAULT_SEGMENT_DIR, npc_grid=None, force: bool = False,
+                     input_set: Path | None = None):
+    """input_set: explicit Bergen-cleaned .set to use (e.g. <seg>_bergen_250hz.set from
+    cleanP01). If None, the newest *bergen*.set in segment_dir is used."""
     segment_dir = Path(segment_dir).resolve()
     seg_name = segment_dir.name
     subject_id = segment_dir.parent.parent.name if segment_dir.parent.name == "segments" else segment_dir.parent.name
@@ -495,7 +493,7 @@ def run_bcg_pipeline(segment_dir: Path = DEFAULT_SEGMENT_DIR, npc_grid=None, for
         d.mkdir(parents=True, exist_ok=True)
 
     # 1. Load Bergen-cleaned .set
-    set_path = _find_bergen_set(segment_dir)
+    set_path = Path(input_set) if input_set else _find_bergen_set(segment_dir)
     print(f"  Loading Bergen-clean: {set_path.name} ({set_path.stat().st_size/1e6:.0f} MB)")
     raw = _load_set_as_raw(set_path)
     print(f"  {len(raw.ch_names)} channels @ {raw.info['sfreq']:.0f} Hz, {raw.n_times} samples")

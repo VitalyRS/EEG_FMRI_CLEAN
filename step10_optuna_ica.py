@@ -41,10 +41,12 @@ import matplotlib.pyplot as plt
 
 try:
     from .config import (MATLAB_BIN, EEGLAB_DIR, PROJECT_ROOT,
-                         DEFAULT_SEGMENT_DIR, ALPHA_BAND, GRADIENT_HARMONICS)
+                         DEFAULT_SEGMENT_DIR, ALPHA_BAND, GRADIENT_HARMONICS,
+                         ICLABEL_OTHER_BRAIN_MAX)
 except ImportError:
     from config import (MATLAB_BIN, EEGLAB_DIR, PROJECT_ROOT,
-                         DEFAULT_SEGMENT_DIR, ALPHA_BAND, GRADIENT_HARMONICS)
+                         DEFAULT_SEGMENT_DIR, ALPHA_BAND, GRADIENT_HARMONICS,
+                         ICLABEL_OTHER_BRAIN_MAX)
 
 DATA_ROOT = PROJECT_ROOT / "data"
 DEFAULT_EXPERIMENT = "1916"
@@ -103,6 +105,22 @@ ICLABEL_CLASSES = ["Brain", "Muscle", "Eye", "Heart", "Line", "Chan", "Other"]
 ARTIFACT_IDX = [1, 2, 3, 4, 5]   # Muscle, Eye, Heart, Line, Chan (0-based)
 OTHER_IDX = 6
 BRAIN_IDX = 0
+
+# Rule-2 cutoff: reject an 'Other'-dominant IC only if P(Brain) < this value.
+OTHER_BRAIN_MAX = ICLABEL_OTHER_BRAIN_MAX
+# Optional cap on the number of ICA components (PCA reduction before runica).
+# None = only reduce when the data is rank-deficient (original behaviour).
+ICA_PCA_MAX = None
+# High-pass filter exclusively for ICA training (Hz).
+ICA_HP_HZ = 1.0
+# ICLabel backend: "python" (mne-icalabel, recommended) or "matlab"
+ICLABEL_BACKEND = "python"
+
+
+
+def _pca_cap_ml() -> str:
+    """MATLAB line that caps n_pca at ICA_PCA_MAX (empty if no cap)."""
+    return f"n_pca = min(n_pca, {int(ICA_PCA_MAX)});" if ICA_PCA_MAX else ""
 
 
 def _find_bcg_fif(segment_dir: Path) -> Path:
@@ -201,7 +219,7 @@ for fi = 1:numel(flat_grid)
 end
 save('{out_mat.resolve()}', 'res', '-v7');
 clear EEG EEG_c;
-exit(0);
+quit force;
 """
     with open(m_file, "w", encoding="ascii") as f:
         f.write(code)
@@ -209,7 +227,7 @@ exit(0);
     print("  [Phase 1] Grid-searching clean_rawdata parameters (no ICA)...")
     try:
         res = subprocess.run(
-            [str(MATLAB_BIN), "-nodesktop", "-nosplash", "-batch", f"run('{m_file.resolve()}')"],
+            [str(MATLAB_BIN), "-nodisplay", "-nodesktop", "-nosplash", "-batch", f"run('{m_file.resolve()}')"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900
         )
     except subprocess.TimeoutExpired:
@@ -218,7 +236,7 @@ exit(0);
         return []
     m_file.unlink(missing_ok=True)
 
-    if res.returncode != 0 or not out_mat.exists():
+    if not out_mat.exists():
         print(f"  [Phase 1] MATLAB failed (rc={res.returncode}):")
         print(res.stdout[-1500:] if res.stdout else "(no output)")
         return []
@@ -344,26 +362,34 @@ for bi = 1:numel(burst_grid)
 end
 save('{out_mat.resolve()}', 'res', '-v7');
 clear EEG EEG_c;
-exit(0);
+quit force;
 """
     with open(m_file, "w", encoding="ascii") as f:
         f.write(code)
 
     print(f"  [Phase-ASR] Sweeping BurstCriterion {BURST_GRID} (one MATLAB session)...")
-    try:
-        r = subprocess.run(
-            [str(MATLAB_BIN), "-nodesktop", "-nosplash", "-batch", f"run('{m_file.resolve()}')"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=1800
-        )
-    except subprocess.TimeoutExpired:
-        print("  [Phase-ASR] MATLAB timed out; skipping ASR tuning (keeping 'off').")
-        m_file.unlink(missing_ok=True)
-        return []
+    out_mat.unlink(missing_ok=True)
+    import time
+    proc = subprocess.Popen(
+        [str(MATLAB_BIN), "-nodisplay", "-nodesktop", "-nosplash", "-batch", f"run('{m_file.resolve()}')"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    )
+    start_t = time.time()
+    while proc.poll() is None:
+        if time.time() - start_t > 1800:
+            print("  [Phase-ASR] MATLAB timed out; skipping ASR tuning (keeping 'off').")
+            proc.kill()
+            break
+        if out_mat.exists() and (time.time() - out_mat.stat().st_mtime > 3):
+            # File is written and settled; MATLAB may be stuck in futex on exit
+            time.sleep(1)
+            proc.kill()
+            break
+        time.sleep(2)
     m_file.unlink(missing_ok=True)
 
-    if r.returncode != 0 or not out_mat.exists():
-        print(f"  [Phase-ASR] MATLAB failed (rc={r.returncode}); keeping ASR 'off'.")
-        print(r.stdout[-1500:] if r.stdout else "(no output)")
+    if not out_mat.exists():
+        print("  [Phase-ASR] MATLAB script failed to produce phase_asr.mat; keeping ASR 'off'.")
         return []
 
     m = loadmat(out_mat, squeeze_me=False, struct_as_record=False)
@@ -438,38 +464,27 @@ def score_phase_asr(asr_results: list[dict], sfreq: float) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: run clean_rawdata (best params) + runica + ICLabel ONCE
-# ---------------------------------------------------------------------------
 def run_phase2_ica(work_dir: Path, mat_in: Path, best_ch: dict) -> dict | None:
-    """
-    With the Phase-1 winning clean_rawdata params, run clean_rawdata + runica +
-    ICLabel ONCE. Save the ICA matrices + ICLabel classifications + the
-    channel-pruned data so Phase 3 can sweep thresholds without re-running ICA.
-    """
-    out_mat = work_dir / "phase2_ica.mat"
-    m_file = work_dir / "phase2_ica.m"
-
     clean_rawdata_plugin = EEGLAB_DIR / "plugins" / "clean_rawdata"
     iclabel_plugin = EEGLAB_DIR / "plugins" / "ICLabel"
 
-    code = f"""
+    out_mat = work_dir / "phase2_ica.mat"
+    
+    # --- 1. MATLAB: clean_rawdata ---
+    m_clean = work_dir / "phase2_clean.m"
+    code_clean = f"""
 addpath('{EEGLAB_DIR.resolve()}');
 addpath('{clean_rawdata_plugin.resolve()}');
-addpath('{iclabel_plugin.resolve()}');
-addpath('{DIPFIT_DIR.resolve()}');
 eeglab nogui;
 
 load('{mat_in.resolve()}', 'data', 'srate', 'labels');
 EEG = eeg_emptyset();
-EEG.setname = 'phase2';
 EEG.data = double(data);
 EEG.srate = double(srate);
 EEG.nbchan = size(data, 1);
 EEG.pnts = size(data, 2);
-EEG.trials = 1;
 EEG.xmin = 0;
 EEG.xmax = (EEG.pnts - 1) / EEG.srate;
-
 EEG.chanlocs = struct([]);
 for i = 1:EEG.nbchan
     if iscell(labels)
@@ -480,108 +495,160 @@ for i = 1:EEG.nbchan
 end
 EEG = eeg_checkset(EEG);
 EEG = pop_chanedit(EEG, 'lookup', '{STD_1005.resolve()}');
-EEG = eeg_checkset(EEG);
-orig_chans = {{EEG.chanlocs.labels}};
 
-% clean_rawdata with the Phase-1 winning parameters
 EEG_clean = pop_clean_rawdata(EEG, ...
     'FlatlineCriterion', {best_ch['flatline_crit']}, ...
     'ChannelCriterion', {best_ch['channel_crit']}, ...
     'LineNoiseCriterion', {best_ch['line_crit']}, ...
-    'Highpass', 'off', ...
-    'BurstCriterion', 'off', ...
-    'WindowCriterion', 'off', ...
-    'BurstRejection', 'off', ...
-    'Distance', 'Euclidian');
+    'Highpass', 'off', 'BurstCriterion', 'off', 'WindowCriterion', 'off', ...
+    'BurstRejection', 'off', 'Distance', 'Euclidian');
 
-kept_chans = {{EEG_clean.chanlocs.labels}};
-removed_chans = setdiff(orig_chans, kept_chans);
-n_removed = length(removed_chans);
-n_chans_after = EEG_clean.nbchan;
-fprintf('Channels after clean_rawdata: %d (removed %d)\\n', n_chans_after, n_removed);
+pop_saveset(EEG_clean, 'filename', 'phase2_clean.set', 'filepath', '{work_dir.resolve().as_posix()}');
+quit force;
+"""
+    m_clean.write_text(code_clean, encoding="ascii")
+    print(f"  [Phase 2] Running clean_rawdata in MATLAB (ch={best_ch['channel_crit']}, flat={best_ch['flatline_crit']}, line={best_ch['line_crit']})...")
+    res = subprocess.run([str(MATLAB_BIN), "-nodisplay", "-nodesktop", "-nosplash", "-batch", f"run('{m_clean.resolve()}')"],
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    clean_set = work_dir / "phase2_clean.set"
+    if not clean_set.exists():
+        print("  [Phase 2] MATLAB clean_rawdata failed.")
+        print(res.stdout[-1500:] if res.stdout else "")
+        return None
 
-% Rank-safe ICA (PCA-reduce if rank-deficient)
-data_rank = rank(double(EEG_clean.data'));
-fprintf('Data rank: %d, Channels: %d\\n', data_rank, n_chans_after);
-if data_rank < n_chans_after
-    fprintf('Reducing dimensionality to rank %d via PCA\\n', data_rank);
-    EEG_clean = pop_runica(EEG_clean, 'icatype', 'runica', 'extended', 1, 'interrupt', 'off', 'pca', data_rank);
-else
-    EEG_clean = pop_runica(EEG_clean, 'icatype', 'runica', 'extended', 1, 'interrupt', 'off');
-end
-n_ic = size(EEG_clean.icaweights, 1);
-fprintf('Number of ICs computed: %d\\n', n_ic);
+    if ICLABEL_BACKEND == "python":
+        import mne
+        from mne.preprocessing import ICA
+        from mne_icalabel.iclabel import iclabel_label_components
+        import scipy.io as sio
 
-% ICLabel classification (threshold-independent!)
-EEG_clean = pop_iclabel(EEG_clean, 'default');
-ic_classes = EEG_clean.etc.ic_classification.ICLabel.classifications;
+        raw_clean = mne.io.read_raw_eeglab(clean_set, preload=True, verbose=False)
+        kept_labels = list(raw_clean.ch_names)
 
-% Save everything Phase 3 needs to sweep thresholds in Python.
-icaweights = EEG_clean.icaweights;
-icasphere  = EEG_clean.icasphere;
-icawinv    = EEG_clean.icawinv;
-pruned_data = single(EEG_clean.data);  % channel-pruned, pre-IC-removal (uV)
-kept_labels = kept_chans;
-if n_removed == 0
-    removed_str = '';
-else
-    removed_str = strjoin(removed_chans, ',');
-end
-save('{out_mat.resolve()}', 'icaweights', 'icasphere', 'icawinv', ...
-     'ic_classes', 'pruned_data', 'n_ic', 'n_removed', 'removed_str', ...
-     'kept_labels', '-v7');
-clear EEG EEG_clean;
+        mat_orig = sio.loadmat(mat_in)
+        labels_raw = mat_orig["labels"]
+        if hasattr(labels_raw, "flatten"):
+            orig_chans = [str(x[0]) if len(x) > 0 and isinstance(x, (np.ndarray, list)) else str(x).strip() for x in labels_raw.flatten()]
+        else:
+            orig_chans = kept_labels
+        removed = [c for c in orig_chans if c not in kept_labels]
+
+        raw_for_ica = raw_clean.copy().filter(l_freq=1.0, h_freq=100.0, verbose=False).set_eeg_reference('average', verbose=False)
+        data_rank = np.linalg.matrix_rank(raw_for_ica.get_data())
+        n_pca = min(data_rank, int(ICA_PCA_MAX)) if ICA_PCA_MAX else data_rank
+        print(f"  [Phase 2] Fast Picard ICA in Python: {len(kept_labels)} ch, rank {data_rank}, {n_pca} ICs")
+
+        ica_mne = ICA(n_components=n_pca, method='picard', fit_params=dict(ortho=False, extended=True), random_state=42, max_iter=500)
+        ica_mne.fit(raw_for_ica, verbose=False)
+
+        print("  [Phase 2] Running ICLabel classification (mne-icalabel in Python)...")
+        ic_classes = iclabel_label_components(raw_for_ica, ica_mne)
+
+        icaweights = ica_mne.unmixing_matrix_ @ ica_mne.pca_components_[:ica_mne.n_components_]
+        icasphere = np.eye(len(kept_labels))
+        icawinv = np.linalg.pinv(icaweights)
+        pruned_data = raw_clean.get_data()  # Volts!
+        pca_mean = getattr(ica_mne, "pca_mean_", np.zeros(len(kept_labels)))
+
+        m_clean.unlink(missing_ok=True)
+        (work_dir / "phase2_clean.set").unlink(missing_ok=True)
+        (work_dir / "phase2_clean.fdt").unlink(missing_ok=True)
+
+        ica = {
+            "icaweights": np.asarray(icaweights, dtype=np.float64),
+            "icasphere": np.asarray(icasphere, dtype=np.float64),
+            "icawinv": np.asarray(icawinv, dtype=np.float64),
+            "ic_classes": np.asarray(ic_classes, dtype=np.float64),
+            "pruned_data": np.asarray(pruned_data, dtype=np.float64),
+            "pca_mean": np.asarray(pca_mean, dtype=np.float64),
+            "n_ic": n_pca,
+            "n_removed": len(removed),
+            "removed_chans": removed,
+        }
+    else:
+        # MATLAB fallback
+        import mne
+        from mne.preprocessing import ICA
+        import scipy.io as sio
+
+        raw_clean = mne.io.read_raw_eeglab(clean_set, preload=True, verbose=False)
+        kept_labels = list(raw_clean.ch_names)
+        raw_ica = raw_clean.copy().filter(l_freq=ICA_HP_HZ, h_freq=None, verbose=False)
+        data_rank = np.linalg.matrix_rank(raw_clean.get_data())
+        n_pca = min(data_rank, int(ICA_PCA_MAX)) if ICA_PCA_MAX else data_rank
+
+        ica_mne = ICA(n_components=n_pca, method='picard', random_state=42, max_iter=500)
+        ica_mne.fit(raw_ica, verbose=False)
+
+        icaweights = ica_mne.unmixing_matrix_ @ ica_mne.pca_components_[:ica_mne.n_components_] * 1e-6
+        icasphere = np.eye(len(kept_labels))
+        icawinv = np.linalg.pinv(icaweights)
+
+        out_weights_mat = work_dir / "phase2_weights.mat"
+        sio.savemat(out_weights_mat, {
+            "icaweights": icaweights.astype(np.float64),
+            "icasphere": icasphere.astype(np.float64),
+            "icawinv": icawinv.astype(np.float64)
+        }, do_compression=True)
+
+        m_iclabel = work_dir / "phase2_iclabel.m"
+        code_iclabel = f"""
+addpath('{EEGLAB_DIR.resolve()}');
+addpath('{iclabel_plugin.resolve()}');
+addpath('{DIPFIT_DIR.resolve()}');
+eeglab nogui;
+
+EEG = pop_loadset('filename', 'phase2_clean.set', 'filepath', '{work_dir.resolve().as_posix()}');
+load('{out_weights_mat.resolve()}', 'icaweights', 'icasphere', 'icawinv');
+
+EEG.icaweights = icaweights;
+EEG.icasphere = icasphere;
+EEG.icawinv = icawinv;
+EEG.icachansind = 1:EEG.nbchan;
+
+EEG = pop_iclabel(EEG, 'default');
+ic_classes = EEG.etc.ic_classification.ICLabel.classifications;
+n_ic = size(icaweights, 1);
+save('{out_mat.resolve()}', 'icaweights', 'icasphere', 'icawinv', 'ic_classes', 'n_ic', '-v7');
 exit(0);
 """
-    with open(m_file, "w", encoding="ascii") as f:
-        f.write(code)
-
-    print(f"  [Phase 2] Running clean_rawdata + runica + ICLabel ONCE "
-          f"(ch={best_ch['channel_crit']}, flat={best_ch['flatline_crit']}, "
-          f"line={best_ch['line_crit']})...")
-    try:
-        res = subprocess.run(
-            [str(MATLAB_BIN), "-nodesktop", "-nosplash", "-batch", f"run('{m_file.resolve()}')"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=1800
-        )
-    except subprocess.TimeoutExpired:
-        print("  [Phase 2] MATLAB timed out (>1800s).")
-        m_file.unlink(missing_ok=True)
+        m_iclabel.write_text(code_iclabel, encoding="ascii")
+        res = subprocess.run([str(MATLAB_BIN), "-nodisplay", "-nodesktop", "-nosplash", "-batch", f"run('{m_iclabel.resolve()}')"],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        m = loadmat(out_mat)
         out_mat.unlink(missing_ok=True)
-        return None
-    m_file.unlink(missing_ok=True)
+        m_clean.unlink(missing_ok=True)
+        m_iclabel.unlink(missing_ok=True)
+        out_weights_mat.unlink(missing_ok=True)
+        clean_set.unlink(missing_ok=True)
+        (work_dir / "phase2_clean.fdt").unlink(missing_ok=True)
 
-    if res.returncode != 0 or not out_mat.exists():
-        print(f"  [Phase 2] MATLAB failed (rc={res.returncode}):")
-        print(res.stdout[-1800:] if res.stdout else "(no output)")
-        return None
+        mat_orig = sio.loadmat(mat_in)
+        orig_chans = [str(x[0]) if len(x) > 0 and isinstance(x, (np.ndarray, list)) else str(x).strip() for x in mat_orig["labels"].flatten()]
+        removed = [c for c in orig_chans if c not in kept_labels]
 
-    m = loadmat(out_mat)
-    out_mat.unlink(missing_ok=True)
+        ica = {
+            "icaweights": np.asarray(m["icaweights"], dtype=np.float64),
+            "icasphere": np.asarray(m["icasphere"], dtype=np.float64),
+            "icawinv": np.asarray(m["icawinv"], dtype=np.float64),
+            "ic_classes": np.asarray(m["ic_classes"], dtype=np.float64),
+            "pruned_data": np.asarray(raw_clean.get_data(), dtype=np.float64),
+            "pca_mean": np.zeros(len(kept_labels), dtype=np.float64),
+            "n_ic": int(m["n_ic"][0, 0]),
+            "n_removed": len(removed),
+            "removed_chans": removed,
+        }
 
-    removed_str = m["removed_str"]
-    removed_str = str(removed_str[0]) if np.size(removed_str) else ""
-    removed = [c for c in removed_str.split(",") if c] if removed_str else []
-
-    ica = {
-        "icaweights": np.asarray(m["icaweights"], dtype=np.float64),
-        "icasphere": np.asarray(m["icasphere"], dtype=np.float64),
-        "icawinv": np.asarray(m["icawinv"], dtype=np.float64),
-        "ic_classes": np.asarray(m["ic_classes"], dtype=np.float64),
-        "pruned_data": np.asarray(m["pruned_data"], dtype=np.float64) * 1e-6,  # µV → V
-        "n_ic": int(m["n_ic"][0, 0]),
-        "n_removed": int(m["n_removed"][0, 0]),
-        "removed_chans": removed,
-    }
-
-    # Cache the expensive ICA result so re-runs / rule tweaks skip MATLAB.
+    # Cache the ICA result
     cache = work_dir / "phase2_ica_cache.npz"
     np.savez_compressed(
         cache,
         icaweights=ica["icaweights"], icasphere=ica["icasphere"],
         icawinv=ica["icawinv"], ic_classes=ica["ic_classes"],
-        pruned_data=ica["pruned_data"], n_ic=ica["n_ic"],
-        n_removed=ica["n_removed"], removed_chans=np.array(removed, dtype=object),
+        pruned_data=ica["pruned_data"], pca_mean=ica.get("pca_mean", np.zeros(1)),
+        n_ic=ica["n_ic"], n_removed=ica["n_removed"],
+        removed_chans=np.array(removed, dtype=object),
+        best_ch=json.dumps({k: best_ch[k] for k in ("flatline_crit", "channel_crit", "line_crit")}),
     )
     return ica
 
@@ -592,13 +659,18 @@ def load_phase2_cache(work_dir: Path) -> dict | None:
     if not cache.exists():
         return None
     d = np.load(cache, allow_pickle=True)
-    return {
+    out = {
         "icaweights": d["icaweights"], "icasphere": d["icasphere"],
         "icawinv": d["icawinv"], "ic_classes": d["ic_classes"],
         "pruned_data": d["pruned_data"], "n_ic": int(d["n_ic"]),
         "n_removed": int(d["n_removed"]),
         "removed_chans": list(d["removed_chans"]),
     }
+    if "pca_mean" in d.files:
+        out["pca_mean"] = d["pca_mean"]
+    if "best_ch" in d.files:   # channel params actually used for this ICA
+        out["best_ch"] = json.loads(str(d["best_ch"]))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -627,7 +699,7 @@ def decide_rejected_ics(ic_classes: np.ndarray, thresh: float) -> np.ndarray:
     is_artifact = np.isin(dominant, ARTIFACT_IDX) & (max_prob >= thresh)
 
     # Rule 2: "Other" with near-zero brain probability
-    is_other_nonbrain = (dominant == OTHER_IDX) & (brain_prob < 0.02)
+    is_other_nonbrain = (dominant == OTHER_IDX) & (brain_prob < OTHER_BRAIN_MAX)
 
     return is_artifact | is_other_nonbrain
 
@@ -641,9 +713,16 @@ def reconstruct_without_ics(ica: dict, reject_mask: np.ndarray) -> np.ndarray:
     Returns cleaned channel-pruned data (V).
     """
     unmix = ica["icaweights"] @ ica["icasphere"]        # (n_ic, n_ch)
-    act = unmix @ ica["pruned_data"]                    # (n_ic, n_samples)
-    act[reject_mask, :] = 0.0
-    data_clean = ica["icawinv"] @ act                   # (n_ch, n_samples)
+    mean = ica.get("pca_mean", None)
+    if mean is not None and mean.ndim > 0 and mean.shape[0] == ica["pruned_data"].shape[0]:
+        mean_col = mean[:, None]
+        act = unmix @ (ica["pruned_data"] - mean_col)
+        act[reject_mask, :] = 0.0
+        data_clean = ica["icawinv"] @ act + mean_col
+    else:
+        act = unmix @ ica["pruned_data"]                    # (n_ic, n_samples)
+        act[reject_mask, :] = 0.0
+        data_clean = ica["icawinv"] @ act                   # (n_ch, n_samples)
     return data_clean
 
 
@@ -792,7 +871,7 @@ def run_optuna_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, n_trials: int = 20, 
               f"{ica['n_removed']} channels removed (MATLAB skipped).\n")
         # For cached ICA, we don't re-run Phase 1 either (assume same input)
         p1 = []
-        best_ch = {"flatline_crit": 5.0, "channel_crit": 0.75, "line_crit": 4.0}
+        best_ch = ica.get("best_ch") or {"flatline_crit": 5.0, "channel_crit": 0.75, "line_crit": 4.0}
     else:
         # ---- Phase 1: clean_rawdata grid ----
         p1 = run_phase1_channels(work_dir, mat_in)
@@ -863,7 +942,16 @@ def run_optuna_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, n_trials: int = 20, 
     }
     for name in ("optuna_ica_best_params.json", "ica_optuna_best.json"):
         with open(segment_dir / name, "w", encoding="utf-8") as f:
-            json.dump(res_dict, f, indent=2)
+            json.dump(
+                res_dict,
+                f,
+                indent=2,
+                default=lambda o: int(o) if isinstance(o, (np.integer, int)) else (
+                    float(o) if isinstance(o, (np.floating, float)) else (
+                        o.tolist() if isinstance(o, np.ndarray) else str(o)
+                    )
+                ),
+            )
 
     plot_two_phase_summary(p1, sweep, best_params, segment_dir)
     return best_params

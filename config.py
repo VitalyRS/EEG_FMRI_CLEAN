@@ -14,7 +14,7 @@ BERGEN_DIR = Path(os.getenv("BERGEN_DIR", str(EEGLAB_DIR / "plugins" / "BERGEN1.
 # External raw dataset paths
 EEG_ORIGINAL_ROOT = Path(os.getenv(
     "EEG_ORIGINAL_ROOT",
-    "/media/vitaly/48DEA853CCEBFBF0/0DATDA_2026_eeg_fnri/fmri/eeg-fmri/original"
+    "/media/vitaly/48DEA853CCEBFBF0/0DATDA_2026_eeg_fnri/EEG_in_original"
 ))
 FMRI_ROOT = Path(os.getenv(
     "FMRI_ROOT",
@@ -50,4 +50,29 @@ ALPHA_BAND = (8.0, 13.0)
 BG_BANDS = ((5.0, 8.0), (13.0, 16.0))
 EVAL_CHANNELS = ["O1", "Oz", "O2", "Pz", "P3", "P4", "Fz", "Cz"]
 MIN_ALPHA_PRESERVATION = 0.80
+
+# ==============================================================================
+# Pipeline Cleaning & Filtering Parameters (Tunable for artifact control)
+# ==============================================================================
+
+# Filtering & Resampling (Step 08)
+TARGET_SFREQ = 250.0          # Hz after resampling (Nyquist = 125 Hz)
+FILTER_HP = 1.0               # Hz: High-pass (1.0 Hz removes slow drift & sweat)
+FILTER_LP = 80.0              # Hz: Low-pass (keeps low gamma, avoids Nyquist edge)
+
+# BCG Artifact Removal (Step 08 OBS)
+BCG_DEFAULT_NPC = 4           # Number of PCA basis components in OBS (range: 3-5)
+BCG_ALPHA_GATE_MIN = 0.75     # Minimum alpha retention gate during OBS sweep
+
+# clean_rawdata & ASR (Artifact Subspace Reconstruction - Steps 10 & 11)
+# Note: Lower ASR_BURST_CRIT (10.0-15.0) actively reconstructs large motion bursts.
+ASR_BURST_CRIT = 15.0         # SD cutoff: 10-15 suppresses large motion spikes; 20 is gentle; 'off' disables
+CHANNEL_CRIT = 0.80           # Neighbor correlation threshold (0.80 is safe: drops bad, keeps Fz/Cz)
+FLATLINE_CRIT = 5.0           # Flatline threshold in seconds
+LINE_NOISE_CRIT = 4.0         # Line noise criterion in SDs
+
+# ICA & ICLabel Rejection (Steps 10 & 11)
+ICLABEL_THRESH = 0.75         # Artifact rejection threshold (0.70 - 0.80)
+ICLABEL_OTHER_BRAIN_MAX = 0.02 # Reject 'Other' noise ICs only if P(Brain) is < this value
+
 

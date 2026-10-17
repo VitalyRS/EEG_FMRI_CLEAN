@@ -16,14 +16,38 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 try:
-    from .config import MATLAB_BIN, EEGLAB_DIR, PROJECT_ROOT, DEFAULT_SEGMENT_DIR, ALPHA_BAND, EVAL_CHANNELS
+    from .config import (MATLAB_BIN, EEGLAB_DIR, PROJECT_ROOT, DEFAULT_SEGMENT_DIR, ALPHA_BAND, EVAL_CHANNELS,
+                         FLATLINE_CRIT, CHANNEL_CRIT, LINE_NOISE_CRIT, ICLABEL_THRESH, ASR_BURST_CRIT,
+                         ICLABEL_OTHER_BRAIN_MAX)
 except ImportError:
-    from config import MATLAB_BIN, EEGLAB_DIR, PROJECT_ROOT, DEFAULT_SEGMENT_DIR, ALPHA_BAND, EVAL_CHANNELS
+    from config import (MATLAB_BIN, EEGLAB_DIR, PROJECT_ROOT, DEFAULT_SEGMENT_DIR, ALPHA_BAND, EVAL_CHANNELS,
+                        FLATLINE_CRIT, CHANNEL_CRIT, LINE_NOISE_CRIT, ICLABEL_THRESH, ASR_BURST_CRIT,
+                        ICLABEL_OTHER_BRAIN_MAX)
+
+# High-pass filter exclusively for ICA training (Hz).
+ICA_HP_HZ = 1.0
+
 
 DATA_ROOT = PROJECT_ROOT / "data"
 DEFAULT_EXPERIMENT = "1916"
 DIPFIT_DIR = EEGLAB_DIR / "plugins" / "dipfit"
 STD_1005 = DIPFIT_DIR / "standard_BEM" / "elec" / "standard_1005.elc"
+
+# Rule-2 cutoff: reject an 'Other'-dominant IC only if P(Brain) < this value.
+OTHER_BRAIN_MAX = ICLABEL_OTHER_BRAIN_MAX
+# Optional cap on the number of ICA components (None = reduce only if rank-deficient).
+ICA_PCA_MAX = None
+# Safety guards against over-cleaning (values below the minimum are clamped).
+GUARD_MIN_ICLABEL_THRESH = 0.65   # -> clamped to 0.80
+GUARD_MIN_CHANNEL_CRIT = 0.70     # -> clamped to 0.80
+GUARD_MIN_BURST_CRIT = 5.0        # -> clamped to 20.0
+# ICLabel backend: "python" (mne-icalabel, recommended) or "matlab"
+ICLABEL_BACKEND = "python"
+
+
+def _pca_cap_ml() -> str:
+    """MATLAB line that caps n_pca at ICA_PCA_MAX (empty if no cap)."""
+    return f"n_pca = min(n_pca, {int(ICA_PCA_MAX)});" if ICA_PCA_MAX else ""
 
 
 def _find_bcg_fif(segment_dir: Path) -> Path:
@@ -35,7 +59,10 @@ def _find_bcg_fif(segment_dir: Path) -> Path:
     return p
 
 
-def apply_optimized_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, force: bool = False):
+def apply_optimized_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, force: bool = False,
+                        params_override: dict | None = None):
+    """params_override: values that replace the step10-optimized ones
+    (keys: flatline_crit, channel_crit, line_crit, iclabel_thresh, burst_crit)."""
     segment_dir = Path(segment_dir).resolve()
     seg = segment_dir.name
     subject_id = segment_dir.parent.parent.name if segment_dir.parent.name == "segments" else segment_dir.parent.name
@@ -66,25 +93,30 @@ def apply_optimized_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, force: bool = F
             best = pdata.get("best_params", pdata)
         print(f"  Loaded best parameters from {params_json.name}:")
     else:
-        print(f"  [WARN] Parameter file not found in {segment_dir}. Using robust defaults.")
+        print(f"  [WARN] Parameter file not found in {segment_dir}. Using robust defaults from config.")
         best = {
-            "flatline_crit": 5.0,
-            "channel_crit": 0.85,
-            "line_crit": 4.0,
-            "iclabel_thresh": 0.80,  # Conservative: only clear artifacts rejected
-            "burst_crit": 20.0       # ASR: gentle burst correction (matches reference asr)
+            "flatline_crit": FLATLINE_CRIT,
+            "channel_crit": CHANNEL_CRIT,
+            "line_crit": LINE_NOISE_CRIT,
+            "iclabel_thresh": ICLABEL_THRESH,
+            "burst_crit": ASR_BURST_CRIT
         }
+
+
+    if params_override:
+        print(f"  Applying parameter overrides: {params_override}")
+        best = {**best, **params_override}
 
     # SAFETY GUARD: clamp Optuna params to prevent over-cleaning.
     # A threshold below 0.65 rejects "probably brain" ICs (P(brain)~0.4) and
     # destroys the signal (previously 0.6 -> 69% of ICs rejected, 77% var drop).
     thr_raw = float(best.get("iclabel_thresh", 0.80))
-    if thr_raw < 0.65:
-        print(f"    [GUARD] iclabel_thresh={thr_raw} is unsafe (< 0.65), clamping to 0.80")
+    if thr_raw < GUARD_MIN_ICLABEL_THRESH:
+        print(f"    [GUARD] iclabel_thresh={thr_raw} is unsafe (< {GUARD_MIN_ICLABEL_THRESH}), clamping to 0.80")
         best["iclabel_thresh"] = 0.80
     ch_raw = float(best.get("channel_crit", 0.85))
-    if ch_raw < 0.70:
-        print(f"    [GUARD] channel_crit={ch_raw} is unsafe (< 0.70), clamping to 0.80")
+    if ch_raw < GUARD_MIN_CHANNEL_CRIT:
+        print(f"    [GUARD] channel_crit={ch_raw} is unsafe (< {GUARD_MIN_CHANNEL_CRIT}), clamping to 0.80")
         best["channel_crit"] = 0.80
 
     # ASR burst-correction strength (SD cutoff k). Lower k = more aggressive.
@@ -96,8 +128,8 @@ def apply_optimized_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, force: bool = F
         burst_crit = "off"
     else:
         burst_val = float(burst_raw)
-        if burst_val < 5.0:
-            print(f"    [GUARD] burst_crit={burst_val} is unsafe (< 5), clamping to 20.0")
+        if burst_val < GUARD_MIN_BURST_CRIT:
+            print(f"    [GUARD] burst_crit={burst_val} is unsafe (< {GUARD_MIN_BURST_CRIT}), clamping to 20.0")
             burst_val = 20.0
         burst_crit = burst_val
 
@@ -134,6 +166,7 @@ def apply_optimized_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, force: bool = F
     channel_crit = best.get("channel_crit", 0.80)
     line_crit = best.get("line_crit", 4.0)
     iclabel_thresh = best.get("iclabel_thresh", 0.70)
+    ica_hp_hz = best.get("ica_hp_hz", ICA_HP_HZ)
 
     # MATLAB literal for BurstCriterion: 'off' (string) or a bare number.
     burst_ml = "'off'" if burst_crit == "off" else f"{float(burst_crit)}"
@@ -141,6 +174,9 @@ def apply_optimized_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, force: bool = F
 
     out_mat = work_dir / "result_full.mat"
     m_file = work_dir / "run_final_ica.m"
+
+    for f in work_dir.glob("temp_*"):
+        f.unlink(missing_ok=True)
 
     helper_dir = Path(__file__).parent.resolve()
     clean_rawdata_plugin = EEGLAB_DIR / "plugins" / "clean_rawdata"
@@ -181,7 +217,9 @@ EEG = eeg_checkset(EEG);
 EEG = pop_chanedit(EEG, 'lookup', '{STD_1005.resolve()}');
 EEG = eeg_checkset(EEG);
 
+pop_saveset(EEG, 'filename', 'temp_full.set', 'filepath', '{work_dir.resolve().as_posix()}');
 chanlocs_full = EEG.chanlocs;
+save('{work_dir.resolve().as_posix()}/temp_chanlocs.mat', 'chanlocs_full', '-v7');
 orig_chans = {{EEG.chanlocs.labels}};
 n_orig = EEG.nbchan;
 
@@ -200,127 +238,203 @@ EEG_clean = pop_clean_rawdata(EEG, ...
     'BurstRejection', 'off', ...
     'Distance', 'Euclidian');
 
+pop_saveset(EEG_clean, 'filename', 'temp_clean.set', 'filepath', '{work_dir.resolve().as_posix()}');
+quit force;
+"""
+    m_file1 = work_dir / "step11_part1.m"
+    with open(m_file1, "w", encoding="ascii") as f:
+        f.write(code)
+
+    print(f"  [Part 1] Running clean_rawdata in MATLAB...")
+    res1 = subprocess.run([str(MATLAB_BIN), "-nodisplay", "-nodesktop", "-nosplash", "-batch", f"run('{m_file1.resolve()}')"],
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if not (work_dir / "temp_clean.set").exists():
+        raise RuntimeError(f"MATLAB Part 1 failed (rc={res1.returncode}):\\n{res1.stdout[-1500:] if res1.stdout else ''}")
+
+    if ICLABEL_BACKEND == "python":
+        print(f"  [Part 2 & 3] Running Picard ICA + mne-icalabel in pure Python...")
+        from mne.preprocessing import ICA
+        from mne_icalabel.iclabel import iclabel_label_components
+
+        raw_full = mne.io.read_raw_eeglab(work_dir / "temp_full.set", preload=True, verbose=False)
+        raw_clean = mne.io.read_raw_eeglab(work_dir / "temp_clean.set", preload=True, verbose=False)
+
+        orig_chans = list(raw_full.ch_names)
+        kept_chans = list(raw_clean.ch_names)
+        removed_chans_list = [c for c in orig_chans if c not in kept_chans]
+        n_removed = len(removed_chans_list)
+        print(f"  Channels after clean_rawdata: {len(kept_chans)} (removed {n_removed}: {removed_chans_list})")
+
+        # Standard ICLabel preprocessing: 1-100 Hz bandpass and average reference
+        raw_for_ica = raw_clean.copy().filter(l_freq=1.0, h_freq=100.0, verbose=False).set_eeg_reference('average', verbose=False)
+
+        data_rank = np.linalg.matrix_rank(raw_for_ica.get_data())
+        n_pca = min(data_rank, int(ICA_PCA_MAX)) if ICA_PCA_MAX else data_rank
+        print(f"  [Part 2] Picard ICA: {len(kept_chans)} channels, rank {data_rank}, {n_pca} components")
+
+        ica = ICA(n_components=n_pca, method='picard', fit_params=dict(ortho=False, extended=True), random_state=42, max_iter=500)
+        ica.fit(raw_for_ica, verbose=False)
+
+        print("  [Part 3] Running ICLabel classification (mne-icalabel)...")
+        ic_classes = iclabel_label_components(raw_for_ica, ica)
+
+        # Balanced rejection rule for EEG-fMRI:
+        artifact_cols = [1, 2, 3, 4, 5]
+        reject_ic_list = []
+        for c in range(n_pca):
+            probs = ic_classes[c]
+            dominant = int(np.argmax(probs))
+            max_prob = float(probs[dominant])
+            brain_prob = float(probs[0])
+            if (dominant in artifact_cols and max_prob >= iclabel_thresh) or (dominant == 6 and brain_prob < OTHER_BRAIN_MAX):
+                reject_ic_list.append(c)
+
+        n_ic_rejected = len(reject_ic_list)
+        n_ic = n_pca
+        print(f"  ICs rejected: {n_ic_rejected} / {n_ic} ({reject_ic_list})")
+
+        # Exclude artifact ICs from the cleaned dataset
+        ica.exclude = reject_ic_list
+        raw_clean_ica = ica.apply(raw_clean.copy(), verbose=False)
+
+        # Transfer cleaned signals back into raw_full
+        for ch in kept_chans:
+            raw_full._data[raw_full.ch_names.index(ch)] = raw_clean_ica.get_data(picks=ch)[0]
+
+        # Spherical spline interpolation of removed channels in MNE
+        if n_removed > 0:
+            print(f"  Interpolating {n_removed} removed channels spherical in MNE...")
+            raw_full.info['bads'] = removed_chans_list
+            raw_full.interpolate_bads(reset_bads=True, mode='accurate', verbose=False)
+
+        print("  Applying common average reference...")
+        raw_full.set_eeg_reference('average', verbose=False)
+        after_data = raw_full.get_data()  # Volts
+
+        m_file1.unlink(missing_ok=True)
+        (work_dir / "temp_full.set").unlink(missing_ok=True)
+        (work_dir / "temp_full.fdt").unlink(missing_ok=True)
+        (work_dir / "temp_clean.set").unlink(missing_ok=True)
+        (work_dir / "temp_clean.fdt").unlink(missing_ok=True)
+        (work_dir / "temp_chanlocs.mat").unlink(missing_ok=True)
+        mat_in.unlink(missing_ok=True)
+    else:
+        # --- MATLAB Part 2 & 3 Fallback ---
+        print("  [Part 2] Running Picard ICA in Python (MNE)...")
+        from mne.preprocessing import ICA
+        import scipy.io as sio
+
+        raw_clean = mne.io.read_raw_eeglab(work_dir / "temp_clean.set", preload=True, verbose=False)
+        raw_ica = raw_clean.copy().filter(l_freq=ica_hp_hz, h_freq=None, verbose=False)
+
+        pruned_data = raw_clean.get_data()
+        data_rank = np.linalg.matrix_rank(pruned_data)
+        n_pca = min(data_rank, int(ICA_PCA_MAX)) if ICA_PCA_MAX else data_rank
+        print(f"    Channels: {len(raw_clean.ch_names)}, Rank: {data_rank}, ICA components: {n_pca}")
+
+        ica = ICA(n_components=n_pca, method='picard', random_state=42, max_iter=500)
+        ica.fit(raw_ica, verbose=False)
+
+        icaweights = ica.unmixing_matrix_ @ ica.pca_components_[:ica.n_components_] * 1e-6
+        icasphere = np.eye(len(raw_clean.ch_names))
+        icawinv = np.linalg.pinv(icaweights)
+
+        sio.savemat(work_dir / "temp_weights.mat", {
+            "icaweights": icaweights.astype(np.float64),
+            "icasphere": icasphere.astype(np.float64),
+            "icawinv": icawinv.astype(np.float64)
+        }, do_compression=True)
+
+        code2 = f"""
+addpath('{EEGLAB_DIR.resolve()}');
+addpath('{iclabel_plugin.resolve()}');
+addpath('{DIPFIT_DIR.resolve()}');
+eeglab nogui;
+
+EEG_clean = pop_loadset('filename', 'temp_clean.set', 'filepath', '{work_dir.resolve().as_posix()}');
+load('{work_dir.resolve().as_posix()}/temp_weights.mat', 'icaweights', 'icasphere', 'icawinv');
+load('{work_dir.resolve().as_posix()}/temp_chanlocs.mat', 'chanlocs_full');
+
+orig_chans = {{'{ "','".join(raw.ch_names) }'}};
 kept_chans = {{EEG_clean.chanlocs.labels}};
 removed_chans = setdiff(orig_chans, kept_chans);
 n_removed = length(removed_chans);
 n_chans_after = EEG_clean.nbchan;
-fprintf('Channels after clean_rawdata: %d (removed %d)\\n', n_chans_after, n_removed);
 
-% Check data rank before ICA
-data_rank = rank(double(EEG_clean.data'));
-fprintf('Data rank: %d, Channels: %d\\n', data_rank, n_chans_after);
-
-% Use PCA reduction if rank < number of channels (prevents degenerate ICA)
-fprintf('Running runica (extended Infomax)...\\n');
-if data_rank < n_chans_after
-    fprintf('Reducing dimensionality to rank %d via PCA\\n', data_rank);
-    EEG_clean = pop_runica(EEG_clean, 'icatype', 'runica', 'extended', 1, 'interrupt', 'off', 'pca', data_rank);
-else
-    EEG_clean = pop_runica(EEG_clean, 'icatype', 'runica', 'extended', 1, 'interrupt', 'off');
-end
+EEG_clean.icaweights = icaweights;
+EEG_clean.icasphere = icasphere;
+EEG_clean.icawinv = icawinv;
+EEG_clean.icachansind = 1:EEG_clean.nbchan;
 
 n_ic = size(EEG_clean.icaweights, 1);
-fprintf('Number of ICs computed: %d\\n', n_ic);
-
-fprintf('Running ICLabel classification...\\n');
 EEG_clean = pop_iclabel(EEG_clean, 'default');
 ic_classes = EEG_clean.etc.ic_classification.ICLabel.classifications;
 
-% Balanced rejection rule for EEG-fMRI (matches step10 Phase-3 sweep):
-% (1) dominant class is a confident artifact (Muscle=2,Eye=3,Heart=4,Line=5,Chan=6)
-%     AND probability >= threshold, OR
-% (2) "Other" (col 7) with brain probability < 0.02 (residual fMRI noise that
-%     ICLabel can't name, but is 98% sure is NOT brain).
-% We do NOT reject on brain_prob<0.20 or Other>=0.90 -- on EEG-fMRI those fire
-% on nearly every component and destroy the alpha rhythm (a_ret 0.93 -> 0.14).
 artifact_cols = [2, 3, 4, 5, 6];
 rej_mask = false(1, n_ic);
 for c = 1:n_ic
     probs = ic_classes(c, :);
     [max_prob, dominant] = max(probs);
     brain_prob = probs(1);
-
-    % Rule 1: confident artifact above threshold
     if any(dominant == artifact_cols) && max_prob >= {iclabel_thresh}
         rej_mask(c) = true;
     end
-
-    % Rule 2: "Other" (column 7) with near-zero brain probability
-    if dominant == 7 && brain_prob < 0.02
+    if dominant == 7 && brain_prob < {float(OTHER_BRAIN_MAX)}
         rej_mask(c) = true;
     end
 end
 reject_ic_list = find(rej_mask);
 n_ic_rejected = length(reject_ic_list);
-fprintf('ICs rejected: %d / %d\\n', n_ic_rejected, n_ic);
 
 if n_ic_rejected > 0
-    % Manual IC removal (compatible with PCA-reduced ICA, unlike pop_subcomp)
-    % Compute IC activations
     ica_act = (EEG_clean.icaweights * EEG_clean.icasphere) * double(EEG_clean.data);
-    % Zero out rejected components
     ica_act(reject_ic_list, :) = 0;
-    % Project back to channel space
     EEG_clean.data = EEG_clean.icawinv * ica_act;
-    fprintf('Removed %d artifact ICs via manual projection\\n', n_ic_rejected);
 end
 
 if n_removed > 0
-    fprintf('Interpolating removed channels spherical...\\n');
     EEG_clean = pop_interp(EEG_clean, chanlocs_full, 'spherical');
 end
 
-fprintf('Applying average reference...\\n');
 EEG_clean = pop_reref(EEG_clean, []);
-
 after_data = single(EEG_clean.data);
 save('{out_mat.resolve()}', 'after_data', 'removed_chans', 'n_removed', 'n_ic_rejected', 'ic_classes', 'reject_ic_list', 'n_ic', '-v7');
 clear EEG EEG_clean;
-fprintf('=== ICA FINISHED SUCCESSFULLY! ===\\n');
 exit(0);
 """
+        m_file2 = work_dir / "step11_part3.m"
+        with open(m_file2, "w", encoding="ascii") as f:
+            f.write(code2)
 
-    with open(m_file, "w", encoding="ascii") as f:
-        f.write(code)
+        print("\n  [Part 3] Running ICLabel and Interpolation in MATLAB...")
+        res2 = subprocess.run([str(MATLAB_BIN), "-nodisplay", "-nodesktop", "-nosplash", "-batch", f"run('{m_file2.resolve()}')"],
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if res2.returncode != 0 or not out_mat.exists():
+            print(res2.stdout[-2000:] if res2.stdout else "")
+            raise RuntimeError(f"MATLAB Part 3 failed (rc={res2.returncode})")
 
-    print("\n  Running MATLAB ICA (this takes 1-3 minutes)...")
-    res = subprocess.run(
-        [str(MATLAB_BIN), "-nodesktop", "-nosplash", "-batch", f"run('{m_file.resolve()}')"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-    )
-    m_file.unlink(missing_ok=True)
+        m_file1.unlink(missing_ok=True)
+        m_file2.unlink(missing_ok=True)
+        (work_dir / "temp_clean.set").unlink(missing_ok=True)
+        (work_dir / "temp_clean.fdt").unlink(missing_ok=True)
+        (work_dir / "temp_weights.mat").unlink(missing_ok=True)
+        (work_dir / "temp_chanlocs.mat").unlink(missing_ok=True)
 
-    if res.returncode != 0 or not out_mat.exists():
-        print(res.stdout[-2000:] if res.stdout else "")
-        raise RuntimeError(f"MATLAB ICA failed (code {res.returncode})")
-
-    # Load result
-    print("\n  Loading ICA result...")
-    m_res = loadmat(out_mat)
-    after_data = m_res["after_data"] * 1e-6  # µV → V (back to MNE units)
-    n_removed = int(m_res["n_removed"][0, 0])
-    n_ic_rejected = int(m_res["n_ic_rejected"][0, 0])
-    n_ic = int(m_res["n_ic"][0, 0])
-    ic_classes = m_res["ic_classes"]
-    if "reject_ic_list" in m_res and m_res["reject_ic_list"].size > 0:
-        reject_ic_list = (m_res["reject_ic_list"].flatten() - 1).tolist()
-    else:
-        reject_ic_list = []
-
-    removed_chans_list = []
-    if n_removed > 0 and "removed_chans" in m_res:
-        rc = m_res["removed_chans"]
-        if hasattr(rc, "size") and rc.size > 0:
-            if rc.ndim == 2:
-                for i in range(rc.shape[1]):
-                    val = rc[0, i]
+        m_res = loadmat(out_mat)
+        after_data = m_res["after_data"] * 1e-6
+        n_removed = int(m_res["n_removed"][0, 0])
+        n_ic_rejected = int(m_res["n_ic_rejected"][0, 0])
+        n_ic = int(m_res["n_ic"][0, 0])
+        ic_classes = m_res["ic_classes"]
+        reject_ic_list = (m_res["reject_ic_list"].flatten() - 1).tolist() if ("reject_ic_list" in m_res and m_res["reject_ic_list"].size > 0) else []
+        removed_chans_list = []
+        if n_removed > 0 and "removed_chans" in m_res:
+            rc = m_res["removed_chans"]
+            if hasattr(rc, "size") and rc.size > 0:
+                for val in rc.flatten():
                     removed_chans_list.append(str(val[0]) if isinstance(val, (np.ndarray, list)) else str(val))
-            elif rc.ndim == 1:
-                for val in rc:
-                    removed_chans_list.append(str(val[0]) if isinstance(val, (np.ndarray, list)) else str(val))
-
-    out_mat.unlink(missing_ok=True)
-    mat_in.unlink(missing_ok=True)
+        out_mat.unlink(missing_ok=True)
+        mat_in.unlink(missing_ok=True)
 
     # Compute metrics
     print("  Computing metrics...")
@@ -346,7 +460,14 @@ exit(0);
         "n_ic_rejected": n_ic_rejected,
         "rejected_ics": [int(x) for x in reject_ic_list],
         "sfreq": sfreq,
-        "iclabel_thresh": float(iclabel_thresh)
+        "iclabel_thresh": float(iclabel_thresh),
+        "params_used": {
+            "flatline_crit": float(flatline_crit), "channel_crit": float(channel_crit),
+            "line_crit": float(line_crit), "iclabel_thresh": float(iclabel_thresh),
+            "burst_crit": burst_crit if burst_crit == "off" else float(burst_crit),
+            "other_brain_max": float(OTHER_BRAIN_MAX),
+            "ica_pca_max": int(ICA_PCA_MAX) if ICA_PCA_MAX else None,
+        },
     }
 
     print(f"\n  Alpha retention: {alpha_retention:.2%}")
@@ -370,7 +491,16 @@ exit(0);
     # Save metrics
     metrics_json = out_deriv_dir / f"{seg}_ica_metrics.json"
     with open(metrics_json, "w") as f:
-        json.dump(metrics, f, indent=2)
+        json.dump(
+            metrics,
+            f,
+            indent=2,
+            default=lambda o: int(o) if isinstance(o, (np.integer, int)) else (
+                float(o) if isinstance(o, (np.floating, float)) else (
+                    o.tolist() if isinstance(o, np.ndarray) else str(o)
+                )
+            ),
+        )
 
     # Save removed channels list
     ch_deriv_dir = DATA_ROOT / subject_id / "derivatives" / "04_channels" / seg

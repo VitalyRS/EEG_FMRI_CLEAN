@@ -37,7 +37,7 @@ import numpy as np
 # ---------------------------------------------------------------------------
 EEG_ORIGINAL_ROOT = Path(os.getenv(
     "EEG_ORIGINAL_ROOT",
-    "/media/vitaly/48DEA853CCEBFBF0/0DATDA_2026_eeg_fnri/fmri/eeg-fmri/original"
+    "/media/vitaly/48DEA853CCEBFBF0/0DATDA_2026_eeg_fnri/EEG_in_original"
 ))
 FMRI_ROOT = Path(os.getenv(
     "FMRI_ROOT",

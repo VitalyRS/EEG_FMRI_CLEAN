@@ -46,18 +46,13 @@ import mne
 # ---------------------------------------------------------------------------
 # Paths and Environment Configuration
 # ---------------------------------------------------------------------------
-PROJECT_ROOT = Path(__file__).parent.resolve()
-DATA_ROOT    = PROJECT_ROOT / "data"
+try:
+    from .config import PROJECT_ROOT, DATA_ROOT, EEG_ORIGINAL_ROOT, FMRI_ROOT
+except ImportError:
+    from config import PROJECT_ROOT, DATA_ROOT, EEG_ORIGINAL_ROOT, FMRI_ROOT
+
 REPORT_DIR   = PROJECT_ROOT / "reports" / "step01_segment_detection"
 
-EEG_ORIGINAL_ROOT = Path(os.getenv(
-    "EEG_ORIGINAL_ROOT",
-    "/media/vitaly/48DEA853CCEBFBF0/0DATDA_2026_eeg_fnri/fmri/eeg-fmri/original"
-))
-FMRI_ROOT = Path(os.getenv(
-    "FMRI_ROOT",
-    "/media/vitaly/48DEA853CCEBFBF0/0DATDA_2026_eeg_fnri/fmri/fmri"
-))
 
 # ---------------------------------------------------------------------------
 # Detection parameters
@@ -120,8 +115,16 @@ def discover_all_eeg_vhdrs() -> dict[str, Path]:
             sid = m.group(1)
             # Find inside vhdr or any vhdr
             vhdrs = list(d.glob("*_inside.vhdr")) or list(d.glob("*.vhdr"))
-            if vhdrs:
-                subjects[sid] = vhdrs[0]
+            valid_vhdrs = []
+            for v in vhdrs:
+                eeg_file = v.with_suffix(".eeg")
+                if eeg_file.exists() and eeg_file.stat().st_size > 1024 * 1024:
+                    valid_vhdrs.append(v)
+                else:
+                    sz = eeg_file.stat().st_size if eeg_file.exists() else 0
+                    print(f"  [WARN] Skipping {v.name} for subject {sid}: data file {eeg_file.name} is invalid/empty ({sz} bytes).")
+            if valid_vhdrs:
+                subjects[sid] = valid_vhdrs[0]
 
     # Check local data folder (overrides if local raw exists)
     if DATA_ROOT.exists():
@@ -134,9 +137,12 @@ def discover_all_eeg_vhdrs() -> dict[str, Path]:
             sid = m.group(1)
             local_vhdr = d / "raw" / "eeg96" / f"{sid}.vhdr"
             if local_vhdr.exists():
-                subjects[sid] = local_vhdr
+                local_eeg = local_vhdr.with_suffix(".eeg")
+                if local_eeg.exists() and local_eeg.stat().st_size > 1024 * 1024:
+                    subjects[sid] = local_vhdr
 
     return dict(sorted(subjects.items()))
+
 
 
 # ---------------------------------------------------------------------------
@@ -783,11 +789,17 @@ def main() -> None:
         print("\n" + "=" * 80)
         print(f"PROCESSING SUBJECT {sid}")
         print("=" * 80)
-        res = detect_mri_sessions(vhdr_path=vhdr, subject_id=sid, write_report=True)
-        all_results[sid] = res
+        try:
+            res = detect_mri_sessions(vhdr_path=vhdr, subject_id=sid, write_report=True)
+            all_results[sid] = res
+        except Exception as e:
+            print(f"  [ERROR] Subject {sid} failed with error: {e}")
+            import traceback
+            traceback.print_exc()
 
     # Always update the all-subjects summary report
     update_all_subjects_summary_report()
+
 
 
 if __name__ == "__main__":
