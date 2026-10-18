@@ -55,25 +55,21 @@ DEFAULT_EXPERIMENT = "1916"
 OPTUNA_DURATION_SEC = 60.0
 
 # Maximum fraction of channels that can be removed before a clean_rawdata
-# candidate is disqualified in Phase 1.
-MAX_CHANNEL_REMOVAL_FRACTION = 0.20  # 20%
+# candidate is disqualified in Phase 1 (strict: max 5% of channels).
+MAX_CHANNEL_REMOVAL_FRACTION = 0.05
 
 DIPFIT_DIR = EEGLAB_DIR / "plugins" / "dipfit"
 STD_1005 = DIPFIT_DIR / "standard_BEM" / "elec" / "standard_1005.elc"
 
 # ---- Phase 1 search grid for clean_rawdata bad-channel detection ----
-# channel_crit is the dominant driver of channel removal; flatline/line rarely
-# fire on well-preprocessed data, so keep those small and fixed-ish.
+# "off" = do NOT delete channels by correlation; 0.50 = only remove catastrophically bad.
 FLATLINE_GRID = [5.0]
-CHANNEL_GRID = [0.70, 0.75, 0.80, 0.85]
-LINE_GRID = [4.0, 6.0]
+CHANNEL_GRID = ["off", 0.50]
+LINE_GRID = [4.0]
 
 # ---- Phase-ASR grid for BurstCriterion (k = SD cutoff of the ASR reconstruction).
-# Higher k = gentler (fewer bursts touched). 'off' disables ASR entirely (the old
-# behaviour, kept as the conservative anchor). We sweep from gentle -> aggressive
-# and let scoring pick the SOFTEST k that still buys real artifact suppression,
-# so the neural signal is preserved as much as possible (the user's goal).
-BURST_GRID = ["off", 30.0, 20.0, 10.0]
+# ASR reconstructs transient bursts in-place without removing channels.
+BURST_GRID = [20.0, 15.0, 10.0, "off"]
 
 # Above ~40 Hz the reference band (80 Hz LP) still carries residual muscle / MRI
 # vibration that ASR is meant to knock down. We use the drop in 40-80 Hz power as
@@ -146,9 +142,15 @@ def run_phase1_channels(work_dir: Path, mat_in: Path) -> list[dict]:
 
     clean_rawdata_plugin = EEGLAB_DIR / "plugins" / "clean_rawdata"
 
-    flat_ml = "[" + " ".join(f"{v}" for v in FLATLINE_GRID) + "]"
-    ch_ml = "[" + " ".join(f"{v}" for v in CHANNEL_GRID) + "]"
-    line_ml = "[" + " ".join(f"{v}" for v in LINE_GRID) + "]"
+    def _ml_item(v):
+        s = str(v).strip().lower()
+        if s == "off":
+            return "'off'"
+        return f"{float(v)}"
+
+    flat_ml = "{" + ", ".join(_ml_item(v) for v in FLATLINE_GRID) + "}"
+    ch_ml   = "{" + ", ".join(_ml_item(v) for v in CHANNEL_GRID) + "}"
+    line_ml = "{" + ", ".join(_ml_item(v) for v in LINE_GRID) + "}"
 
     code = f"""
 addpath('{EEGLAB_DIR.resolve()}');
@@ -193,9 +195,9 @@ for fi = 1:numel(flat_grid)
     for li = 1:numel(line_grid)
       idx = idx + 1;
       EEG_c = pop_clean_rawdata(EEG, ...
-          'FlatlineCriterion', flat_grid(fi), ...
-          'ChannelCriterion', ch_grid(ci), ...
-          'LineNoiseCriterion', line_grid(li), ...
+          'FlatlineCriterion', flat_grid{{fi}}, ...
+          'ChannelCriterion', ch_grid{{ci}}, ...
+          'LineNoiseCriterion', line_grid{{li}}, ...
           'Highpass', 'off', ...
           'BurstCriterion', 'off', ...
           'WindowCriterion', 'off', ...
@@ -203,17 +205,17 @@ for fi = 1:numel(flat_grid)
           'Distance', 'Euclidian');
       kept = {{EEG_c.chanlocs.labels}};
       removed = setdiff(orig_chans, kept);
-      res(idx).flatline_crit = flat_grid(fi);
-      res(idx).channel_crit  = ch_grid(ci);
-      res(idx).line_crit     = line_grid(li);
+      res(idx).flatline_crit = flat_grid{{fi}};
+      res(idx).channel_crit  = ch_grid{{ci}};
+      res(idx).line_crit     = line_grid{{li}};
       res(idx).n_removed     = numel(removed);
       if isempty(removed)
         res(idx).removed = '';
       else
         res(idx).removed = strjoin(removed, ',');
       end
-      fprintf('P1 flat=%g ch=%g line=%g -> removed %d\\n', ...
-              flat_grid(fi), ch_grid(ci), line_grid(li), numel(removed));
+      fprintf('P1 flat=%s ch=%s line=%s -> removed %d\\n', ...
+              mat2str(flat_grid{{fi}}), mat2str(ch_grid{{ci}}), mat2str(line_grid{{li}}), numel(removed));
     end
   end
 end
@@ -248,13 +250,24 @@ quit force;
         raw_res = [raw_res]
 
     results = []
+    def _parse_val(val):
+        if isinstance(val, (int, float, np.number)):
+            return float(val)
+        s = str(val).strip()
+        if s.lower() == "off":
+            return "off"
+        try:
+            return float(s)
+        except Exception:
+            return s
+
     for r in np.atleast_1d(raw_res):
         removed_str = str(r.removed) if hasattr(r, "removed") else ""
         removed = [c for c in removed_str.split(",") if c] if removed_str else []
         results.append({
-            "flatline_crit": float(r.flatline_crit),
-            "channel_crit": float(r.channel_crit),
-            "line_crit": float(r.line_crit),
+            "flatline_crit": _parse_val(r.flatline_crit),
+            "channel_crit": _parse_val(r.channel_crit),
+            "line_crit": _parse_val(r.line_crit),
             "n_removed": int(r.n_removed),
             "removed_chans": removed,
         })
@@ -263,10 +276,9 @@ quit force;
 
 def score_phase1(candidate: dict, n_channels_original: int) -> float:
     """
-    Score a clean_rawdata candidate (lower is better). We bias CONSERVATIVE
-    (our failure mode was over-removal): prefer removing few channels and never
-    protected/central ones. Removing zero is fine -- better under- than
-    over-clean at the channel stage.
+    Score a clean_rawdata candidate (lower is better).
+    Strictly penalize channel removal to satisfy the requirement of not
+    dropping channels unless absolutely unavoidable.
     """
     n_removed = candidate["n_removed"]
     removed = set(candidate["removed_chans"])
@@ -276,11 +288,12 @@ def score_phase1(candidate: dict, n_channels_original: int) -> float:
     if n_removed / max(n_channels_original, 1) > MAX_CHANNEL_REMOVAL_FRACTION:
         return 1e9 + n_removed
 
-    # Heavy penalty per protected channel removed; mild penalty per channel;
-    # tiny tie-break toward channel_crit ~0.80 for robustness.
-    score = (20.0 * n_central
-             + 1.0 * n_removed
-             + 0.5 * abs(candidate["channel_crit"] - 0.80))
+    ch_crit = candidate["channel_crit"]
+    # Mild tie-break favoring 'off' or gentler thresholds
+    crit_penalty = 0.0 if ch_crit == "off" else (0.05 * float(ch_crit))
+    score = (50.0 * n_central
+             + 10.0 * n_removed
+             + crit_penalty)
     return score
 
 
@@ -302,6 +315,10 @@ def run_phase_asr(work_dir: Path, mat_in: Path, best_ch: dict) -> list[dict]:
     clean_rawdata_plugin = EEGLAB_DIR / "plugins" / "clean_rawdata"
 
     # MATLAB cell of burst settings ('off' or numeric).
+    flat_val = "'off'" if str(best_ch['flatline_crit']).lower() == "off" else f"{float(best_ch['flatline_crit'])}"
+    ch_val = "'off'" if str(best_ch['channel_crit']).lower() == "off" else f"{float(best_ch['channel_crit'])}"
+    line_val = "'off'" if str(best_ch['line_crit']).lower() == "off" else f"{float(best_ch['line_crit'])}"
+
     burst_items = ["'off'" if (isinstance(b, str) and b == "off") else f"{float(b)}"
                    for b in BURST_GRID]
     burst_ml = "{" + ", ".join(burst_items) + "}"
@@ -340,9 +357,9 @@ for bi = 1:numel(burst_grid)
     bc = burst_grid{{bi}};
     % Same channel params for every k so the ONLY difference is ASR strength.
     EEG_c = pop_clean_rawdata(EEG, ...
-        'FlatlineCriterion', {best_ch['flatline_crit']}, ...
-        'ChannelCriterion', {best_ch['channel_crit']}, ...
-        'LineNoiseCriterion', {best_ch['line_crit']}, ...
+        'FlatlineCriterion', {flat_val}, ...
+        'ChannelCriterion', {ch_val}, ...
+        'LineNoiseCriterion', {line_val}, ...
         'Highpass', 'off', ...
         'BurstCriterion', bc, ...
         'WindowCriterion', 'off', ...
@@ -472,6 +489,10 @@ def run_phase2_ica(work_dir: Path, mat_in: Path, best_ch: dict) -> dict | None:
     
     # --- 1. MATLAB: clean_rawdata ---
     m_clean = work_dir / "phase2_clean.m"
+    flat_val = "'off'" if str(best_ch['flatline_crit']).lower() == "off" else f"{float(best_ch['flatline_crit'])}"
+    ch_val = "'off'" if str(best_ch['channel_crit']).lower() == "off" else f"{float(best_ch['channel_crit'])}"
+    line_val = "'off'" if str(best_ch['line_crit']).lower() == "off" else f"{float(best_ch['line_crit'])}"
+
     code_clean = f"""
 addpath('{EEGLAB_DIR.resolve()}');
 addpath('{clean_rawdata_plugin.resolve()}');
@@ -497,9 +518,9 @@ EEG = eeg_checkset(EEG);
 EEG = pop_chanedit(EEG, 'lookup', '{STD_1005.resolve()}');
 
 EEG_clean = pop_clean_rawdata(EEG, ...
-    'FlatlineCriterion', {best_ch['flatline_crit']}, ...
-    'ChannelCriterion', {best_ch['channel_crit']}, ...
-    'LineNoiseCriterion', {best_ch['line_crit']}, ...
+    'FlatlineCriterion', {flat_val}, ...
+    'ChannelCriterion', {ch_val}, ...
+    'LineNoiseCriterion', {line_val}, ...
     'Highpass', 'off', 'BurstCriterion', 'off', 'WindowCriterion', 'off', ...
     'BurstRejection', 'off', 'Distance', 'Euclidian');
 
@@ -910,10 +931,13 @@ def run_optuna_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, n_trials: int = 20, 
     best_sweep = min(sweep, key=lambda m: m["loss"])
     best_thresh = best_sweep["iclabel_thresh"]
 
+    def _export_crit(v):
+        return "off" if str(v).lower() == "off" else float(v)
+
     best_params = {
-        "flatline_crit": float(best_ch["flatline_crit"]),
-        "channel_crit": float(best_ch["channel_crit"]),
-        "line_crit": float(best_ch["line_crit"]),
+        "flatline_crit": _export_crit(best_ch["flatline_crit"]),
+        "channel_crit": _export_crit(best_ch["channel_crit"]),
+        "line_crit": _export_crit(best_ch["line_crit"]),
         "iclabel_thresh": float(best_thresh),
         "burst_crit": (best_burst if best_burst == "off" else float(best_burst)),
     }
@@ -964,15 +988,22 @@ def plot_two_phase_summary(p1: list[dict], sweep: list[dict],
 
     # Phase 1: channel removal vs channel_crit
     if p1:
-        ch_vals = [c["channel_crit"] for c in p1]
+        ch_labels = [str(c["channel_crit"]) for c in p1]
+        unique_labels = list(dict.fromkeys(ch_labels))
+        x_map = {lab: i for i, lab in enumerate(unique_labels)}
+        x_pts = [x_map[lab] for lab in ch_labels]
         n_rm = [c["n_removed"] for c in p1]
         n_central = [len(set(c["removed_chans"]) & PROTECTED_CHANNELS) for c in p1]
-        axes[0].scatter(ch_vals, n_rm, s=70, c="#0984e3", alpha=0.7,
+
+        axes[0].scatter(x_pts, n_rm, s=70, c="#0984e3", alpha=0.7,
                         edgecolors="k", lw=0.4, label="channels removed")
-        axes[0].scatter(ch_vals, n_central, s=70, c="#d63031", alpha=0.7,
+        axes[0].scatter(x_pts, n_central, s=70, c="#d63031", alpha=0.7,
                         marker="x", label="central removed (bad)")
-        axes[0].axvline(best_params["channel_crit"], color="green", lw=2, ls="--",
+        chosen_x = x_map.get(str(best_params["channel_crit"]), 0)
+        axes[0].axvline(chosen_x, color="green", lw=2, ls="--",
                         label=f"chosen={best_params['channel_crit']}")
+        axes[0].set_xticks(range(len(unique_labels)))
+        axes[0].set_xticklabels(unique_labels)
         axes[0].set_xlabel("ChannelCriterion")
         axes[0].set_ylabel("# channels removed")
         axes[0].set_title("Phase 1: clean_rawdata grid")

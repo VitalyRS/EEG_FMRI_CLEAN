@@ -37,10 +37,10 @@ STD_1005 = DIPFIT_DIR / "standard_BEM" / "elec" / "standard_1005.elc"
 OTHER_BRAIN_MAX = ICLABEL_OTHER_BRAIN_MAX
 # Optional cap on the number of ICA components (None = reduce only if rank-deficient).
 ICA_PCA_MAX = None
-# Safety guards against over-cleaning (values below the minimum are clamped).
-GUARD_MIN_ICLABEL_THRESH = 0.65   # -> clamped to 0.80
-GUARD_MIN_CHANNEL_CRIT = 0.70     # -> clamped to 0.80
-GUARD_MIN_BURST_CRIT = 5.0        # -> clamped to 20.0
+# Safety guards against over-cleaning.
+GUARD_MIN_ICLABEL_THRESH = 0.65   # -> clamped to 0.80 if lower
+GUARD_MAX_CHANNEL_CRIT = 0.70     # -> clamped to 0.70 if higher (higher ChannelCriterion = more aggressive deletion)
+GUARD_MIN_BURST_CRIT = 5.0        # -> clamped to 20.0 if lower (lower = more aggressive reconstruction)
 # ICLabel backend: "python" (mne-icalabel, recommended) or "matlab"
 ICLABEL_BACKEND = "python"
 
@@ -114,10 +114,19 @@ def apply_optimized_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, force: bool = F
     if thr_raw < GUARD_MIN_ICLABEL_THRESH:
         print(f"    [GUARD] iclabel_thresh={thr_raw} is unsafe (< {GUARD_MIN_ICLABEL_THRESH}), clamping to 0.80")
         best["iclabel_thresh"] = 0.80
-    ch_raw = float(best.get("channel_crit", 0.85))
-    if ch_raw < GUARD_MIN_CHANNEL_CRIT:
-        print(f"    [GUARD] channel_crit={ch_raw} is unsafe (< {GUARD_MIN_CHANNEL_CRIT}), clamping to 0.80")
-        best["channel_crit"] = 0.80
+    ch_raw = best.get("channel_crit", "off")
+    if isinstance(ch_raw, str) and ch_raw.lower() == "off":
+        channel_crit = "off"
+    else:
+        try:
+            ch_val = float(ch_raw)
+            if GUARD_MAX_CHANNEL_CRIT is not None and ch_val > GUARD_MAX_CHANNEL_CRIT:
+                print(f"    [GUARD] channel_crit={ch_val} is too aggressive (> {GUARD_MAX_CHANNEL_CRIT}), clamping to {GUARD_MAX_CHANNEL_CRIT}")
+                ch_val = float(GUARD_MAX_CHANNEL_CRIT)
+            channel_crit = ch_val
+        except (ValueError, TypeError):
+            channel_crit = "off"
+    best["channel_crit"] = channel_crit
 
     # ASR burst-correction strength (SD cutoff k). Lower k = more aggressive.
     # Below 5 ASR starts reconstructing real neural bursts as "artifact" and
@@ -163,13 +172,16 @@ def apply_optimized_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, force: bool = F
     print(f"  Prepared input MAT: {data.shape[0]} ch x {data.shape[1]} samples (converted to µV)")
 
     flatline_crit = best.get("flatline_crit", 5.0)
-    channel_crit = best.get("channel_crit", 0.80)
+    channel_crit = best.get("channel_crit", "off")
     line_crit = best.get("line_crit", 4.0)
     iclabel_thresh = best.get("iclabel_thresh", 0.70)
     ica_hp_hz = best.get("ica_hp_hz", ICA_HP_HZ)
 
-    # MATLAB literal for BurstCriterion: 'off' (string) or a bare number.
-    burst_ml = "'off'" if burst_crit == "off" else f"{float(burst_crit)}"
+    # MATLAB literal formatting: 'off' (string) or bare float
+    flat_ml = "'off'" if str(flatline_crit).lower() == "off" else f"{float(flatline_crit)}"
+    channel_ml = "'off'" if str(channel_crit).lower() == "off" else f"{float(channel_crit)}"
+    line_ml = "'off'" if str(line_crit).lower() == "off" else f"{float(line_crit)}"
+    burst_ml = "'off'" if str(burst_crit).lower() == "off" else f"{float(burst_crit)}"
     print(f"    ASR BurstCriterion = {burst_crit}  (BurstRejection off -> correct, not cut)")
 
     out_mat = work_dir / "result_full.mat"
@@ -229,9 +241,9 @@ fprintf('Running clean_rawdata with optimized parameters...\\n');
 % this preserves the sample count / duration, exactly like the reference .set.
 % WindowCriterion stays 'off' for the same duration-preservation reason.
 EEG_clean = pop_clean_rawdata(EEG, ...
-    'FlatlineCriterion', {flatline_crit}, ...
-    'ChannelCriterion', {channel_crit}, ...
-    'LineNoiseCriterion', {line_crit}, ...
+    'FlatlineCriterion', {flat_ml}, ...
+    'ChannelCriterion', {channel_ml}, ...
+    'LineNoiseCriterion', {line_ml}, ...
     'Highpass', 'off', ...
     'BurstCriterion', {burst_ml}, ...
     'WindowCriterion', 'off', ...
@@ -306,6 +318,8 @@ quit force;
             print(f"  Interpolating {n_removed} removed channels spherical in MNE...")
             raw_full.info['bads'] = removed_chans_list
             raw_full.interpolate_bads(reset_bads=True, mode='accurate', verbose=False)
+        else:
+            print(f"  All {len(kept_chans)} channels preserved intact (no channel removal, interpolation skipped).")
 
         print("  Applying common average reference...")
         raw_full.set_eeg_reference('average', verbose=False)
@@ -462,9 +476,11 @@ exit(0);
         "sfreq": sfreq,
         "iclabel_thresh": float(iclabel_thresh),
         "params_used": {
-            "flatline_crit": float(flatline_crit), "channel_crit": float(channel_crit),
-            "line_crit": float(line_crit), "iclabel_thresh": float(iclabel_thresh),
-            "burst_crit": burst_crit if burst_crit == "off" else float(burst_crit),
+            "flatline_crit": flatline_crit if str(flatline_crit).lower() == "off" else float(flatline_crit),
+            "channel_crit": channel_crit if str(channel_crit).lower() == "off" else float(channel_crit),
+            "line_crit": line_crit if str(line_crit).lower() == "off" else float(line_crit),
+            "iclabel_thresh": float(iclabel_thresh),
+            "burst_crit": burst_crit if str(burst_crit).lower() == "off" else float(burst_crit),
             "other_brain_max": float(OTHER_BRAIN_MAX),
             "ica_pca_max": int(ICA_PCA_MAX) if ICA_PCA_MAX else None,
         },

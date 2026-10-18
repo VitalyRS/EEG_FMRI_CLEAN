@@ -63,18 +63,18 @@ ica_opt:
   # каналах 60 с (15000 отсчётов) — очень мало (нужно ~20*N^2). Рекомендуется
   # 300 (весь сегмент) или включить iclabel.ica_pca_max.
   duration_sec: 300.0
-  max_channel_removal_fraction: 0.20   # конфиг clean_rawdata, удаляющий >20% каналов, отбрасывается
-  # Сетка clean_rawdata (поиск плохих каналов)
+  max_channel_removal_fraction: 0.05   # жесткий лимит: выбрасывать не более 5% каналов (макс ~4-5)
+  # Сетка clean_rawdata: "off" сохраняет все каналы без удаления (артефакты чистятся через ICA + ASR)
   flatline_grid: [5.0]
-  channel_grid: [0.70, 0.75, 0.80, 0.85]
-  line_grid: [4.0, 6.0]
-  # Сетка ASR BurstCriterion ("off" = без ASR; меньше k = агрессивнее)
-  burst_grid: ["off", 30.0, 20.0, 10.0]
+  channel_grid: ["off"]
+  line_grid: ["off"]
+  # Сетка ASR BurstCriterion: реконструкция всплесков на месте без вырезания каналов
+  burst_grid: [20.0, 15.0, 10.0]
   hf_artifact_band: [40.0, 80.0]   # полоса "артефакта" для оценки пользы ASR
   asr_min_hf_gain: 0.05            # ASR выбирается, если подавляет 40-80 Гц хотя бы на 5%
   asr_min_alpha_ret: 0.90          # ... и сохраняет >= 90% альфы
   # Сетка порогов ICLabel
-  threshold_grid: [0.65, 0.70, 0.75, 0.80, 0.85]
+  threshold_grid: [0.65, 0.70, 0.75, 0.80]
   # Каналы, удаление которых сильно штрафуется
   protected_channels: [Fz, FCz, Cz, CPz, Pz, POz, Oz, AFz,
                        F1, F2, FC1, FC2, C1, C2, CP1, CP2, P1, P2]
@@ -101,18 +101,18 @@ ica_final:
   defaults:
     ica_hp_hz: 1.0       # Гц, high-pass фильтр ТОЛЬКО для обучения ICA (убирает медленные дрейфы)
     flatline_crit: 5.0
-    channel_crit: 0.80
-    line_crit: 4.0
-    iclabel_thresh: 0.75
-    burst_crit: 15.0      # или "off"
+    channel_crit: "off"  # По умолчанию каналы не удаляются (сохраняются все сенсоры)
+    line_crit: "off"     # Линейный шум убирается фильтром/ICA, не удаляя каналы (Fz, C3)
+    iclabel_thresh: 0.70
+    burst_crit: 15.0     # ASR чистит всплески во времени без вырезания каналов
   # Принудительно перекрыть отдельные параметры поверх step10, например:
-  #   force_params: {burst_crit: "off", iclabel_thresh: 0.80}
+  #   force_params: {channel_crit: "off", burst_crit: 15.0}
   force_params: {}
-  # Защита от перечистки: значения ниже минимума заменяются безопасными
+  # Защита от перечистки
   guards:
-    min_iclabel_thresh: 0.65   # -> 0.80
-    min_channel_crit: 0.70     # -> 0.80
-    min_burst_crit: 5.0        # -> 20.0
+    min_iclabel_thresh: 0.65
+    max_channel_crit: 0.70   # Защита: не допускать агрессивного удаления каналов (>0.70)
+    min_burst_crit: 5.0
 
 # -----------------------------------------------------------------------------
 # Выход, отчёты, очистка

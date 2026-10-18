@@ -492,27 +492,31 @@ def run_bcg_pipeline(segment_dir: Path = DEFAULT_SEGMENT_DIR, npc_grid=None, for
     for d in (resamp_dir, bcg_dir, qc_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    # 1. Load Bergen-cleaned .set
-    set_path = Path(input_set) if input_set else _find_bergen_set(segment_dir)
-    print(f"  Loading Bergen-clean: {set_path.name} ({set_path.stat().st_size/1e6:.0f} MB)")
-    raw = _load_set_as_raw(set_path)
-    print(f"  {len(raw.ch_names)} channels @ {raw.info['sfreq']:.0f} Hz, {raw.n_times} samples")
-
-    # 2. Resample -> 250 Hz, then band-pass EEG (1-100 Hz). The high-pass is
-    #    essential: without it sub-1 Hz drift dominates the low band, OBS smears
-    #    its subtraction across 0.7-15 Hz (eating alpha) and the metric is noisy.
-    raw_rs = resample_raw(raw, TARGET_SFREQ)
-    del raw; gc.collect()
-    # Band-pass EEG to FILTER_LP (45 Hz). The low-pass removes the MRI helium-pump
-    # vibration comb (a 1-Hz-spaced harmonic comb spanning 44-100 Hz that Bergen
-    # AAS leaves untouched because it is not gradient-locked). ZapLine was tried
-    # and rejected: it only targets a single mains line (50 Hz) and removed <5%
-    # of this broadband comb. Gamma (>45 Hz) is sacrificed but is buried in the
-    # artifact anyway.
-    raw_rs = bandpass_raw(raw_rs, FILTER_HP, FILTER_LP)
     resamp_fif = resamp_dir / f"{seg_name}_250hz.fif"
-    raw_rs.save(resamp_fif, overwrite=True, verbose=False)
-    print(f"  Saved resampled+filtered: {resamp_fif}")
+    if resamp_fif.exists() and not input_set:
+        print(f"  Found pre-existing resampled 250 Hz data: {resamp_fif.name}, loading directly...")
+        raw_rs = mne.io.read_raw_fif(resamp_fif, preload=True, verbose=False)
+    else:
+        # 1. Load Bergen-cleaned .set
+        set_path = Path(input_set) if input_set else _find_bergen_set(segment_dir)
+        print(f"  Loading Bergen-clean: {set_path.name} ({set_path.stat().st_size/1e6:.0f} MB)")
+        raw = _load_set_as_raw(set_path)
+        print(f"  {len(raw.ch_names)} channels @ {raw.info['sfreq']:.0f} Hz, {raw.n_times} samples")
+
+        # 2. Resample -> 250 Hz, then band-pass EEG (1-100 Hz). The high-pass is
+        #    essential: without it sub-1 Hz drift dominates the low band, OBS smears
+        #    its subtraction across 0.7-15 Hz (eating alpha) and the metric is noisy.
+        raw_rs = resample_raw(raw, TARGET_SFREQ)
+        del raw; gc.collect()
+        # Band-pass EEG to FILTER_LP (45 Hz). The low-pass removes the MRI helium-pump
+        # vibration comb (a 1-Hz-spaced harmonic comb spanning 44-100 Hz that Bergen
+        # AAS leaves untouched because it is not gradient-locked). ZapLine was tried
+        # and rejected: it only targets a single mains line (50 Hz) and removed <5%
+        # of this broadband comb. Gamma (>45 Hz) is sacrificed but is buried in the
+        # artifact anyway.
+        raw_rs = bandpass_raw(raw_rs, FILTER_HP, FILTER_LP)
+        raw_rs.save(resamp_fif, overwrite=True, verbose=False)
+        print(f"  Saved resampled+filtered: {resamp_fif}")
 
     sfreq = float(raw_rs.info["sfreq"])
     ch_names = list(raw_rs.ch_names)
@@ -636,23 +640,47 @@ if __name__ == "__main__":
         subj_seg_dir = DATA_ROOT / args.subject / "segments"
         if args.segment:
             target = subj_seg_dir / args.segment
-            if target.exists():
-                seg_dirs.append(target)
-            else:
-                print(f"[ERROR] Segment folder not found: {target}")
+            target.mkdir(parents=True, exist_ok=True)
+            seg_dirs.append(target)
         else:
             if subj_seg_dir.exists():
                 seg_dirs.extend(sorted(p for p in subj_seg_dir.iterdir() if p.is_dir() and (p / "segment_work_info.json").exists()))
-            else:
-                print(f"[ERROR] No segments directory found for subject {args.subject}: {subj_seg_dir}")
+            if not seg_dirs:
+                for st in ("02_resampled250", "01_bergen_250hz", "03_bcg"):
+                    deriv_st = DATA_ROOT / args.subject / "derivatives" / st
+                    if deriv_st.exists():
+                        for p in sorted(deriv_st.iterdir()):
+                            if p.is_dir():
+                                target = subj_seg_dir / p.name
+                                target.mkdir(parents=True, exist_ok=True)
+                                if target not in seg_dirs:
+                                    seg_dirs.append(target)
+                        if seg_dirs:
+                            break
     elif args.all or (not args.subject and not args.segment):
         for subj_dir in sorted(DATA_ROOT.glob("*")):
+            if not subj_dir.is_dir() or subj_dir.name in ("copy.sh", "logs"):
+                continue
             subj_seg_dir = subj_dir / "segments"
+            sub_found = []
             if subj_seg_dir.exists():
-                seg_dirs.extend(sorted(p for p in subj_seg_dir.iterdir() if p.is_dir() and (p / "segment_work_info.json").exists()))
+                sub_found.extend(sorted(p for p in subj_seg_dir.iterdir() if p.is_dir() and (p / "segment_work_info.json").exists()))
+            if not sub_found:
+                for st in ("02_resampled250", "01_bergen_250hz", "03_bcg"):
+                    deriv_st = subj_dir / "derivatives" / st
+                    if deriv_st.exists():
+                        for p in sorted(deriv_st.iterdir()):
+                            if p.is_dir():
+                                target = subj_seg_dir / p.name
+                                target.mkdir(parents=True, exist_ok=True)
+                                if target not in sub_found:
+                                    sub_found.append(target)
+                        if sub_found:
+                            break
+            seg_dirs.extend(sub_found)
 
     if not seg_dirs:
-        print("[ERROR] No segments found with segment_work_info.json. Run previous steps first!")
+        print("[ERROR] No segments found with segment_work_info.json or derivatives. Run previous steps first!")
     else:
         for sdir in seg_dirs:
             run_bcg_pipeline(sdir.resolve(), npc_grid=args.npc, force=args.force)

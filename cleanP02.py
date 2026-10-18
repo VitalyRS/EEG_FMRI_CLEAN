@@ -83,6 +83,13 @@ def _burst(v):
     return float(v)
 
 
+def _crit(v):
+    """'off' / off(False) / None -> 'off', otherwise float criterion."""
+    if v is None or v is False or (isinstance(v, str) and v.strip().lower() == "off"):
+        return "off"
+    return float(v)
+
+
 def _band(v):
     lo, hi = float(v[0]), float(v[1])
     if not lo < hi:
@@ -108,9 +115,9 @@ PARAM_MAP: dict[tuple, list] = {
     ("bcg", "eval_channels"): [(s08, "EVAL_CHANNELS", _strs)],
     ("ica_opt", "duration_sec"): [(s10, "OPTUNA_DURATION_SEC", float)],
     ("ica_opt", "max_channel_removal_fraction"): [(s10, "MAX_CHANNEL_REMOVAL_FRACTION", float)],
-    ("ica_opt", "flatline_grid"): [(s10, "FLATLINE_GRID", _floats)],
-    ("ica_opt", "channel_grid"): [(s10, "CHANNEL_GRID", _floats)],
-    ("ica_opt", "line_grid"): [(s10, "LINE_GRID", _floats)],
+    ("ica_opt", "flatline_grid"): [(s10, "FLATLINE_GRID", lambda v: [_crit(x) for x in v])],
+    ("ica_opt", "channel_grid"): [(s10, "CHANNEL_GRID", lambda v: [_crit(x) for x in v])],
+    ("ica_opt", "line_grid"): [(s10, "LINE_GRID", lambda v: [_crit(x) for x in v])],
     ("ica_opt", "burst_grid"): [(s10, "BURST_GRID", lambda v: [_burst(x) for x in v])],
     ("ica_opt", "hf_artifact_band"): [(s10, "HF_ARTIFACT_BAND", _band)],
     ("ica_opt", "asr_min_hf_gain"): [(s10, "ASR_MIN_HF_GAIN", float)],
@@ -120,14 +127,15 @@ PARAM_MAP: dict[tuple, list] = {
     ("iclabel", "other_brain_max"): [(s10, "OTHER_BRAIN_MAX", float), (s11, "OTHER_BRAIN_MAX", float)],
     ("iclabel", "ica_pca_max"): [(s10, "ICA_PCA_MAX", _opt_int), (s11, "ICA_PCA_MAX", _opt_int)],
     ("iclabel", "backend"): [(s10, "ICLABEL_BACKEND", str), (s11, "ICLABEL_BACKEND", str)],
-    ("ica_final", "defaults", "flatline_crit"): [(s11, "FLATLINE_CRIT", float)],
-    ("ica_final", "defaults", "channel_crit"): [(s11, "CHANNEL_CRIT", float)],
-    ("ica_final", "defaults", "line_crit"): [(s11, "LINE_NOISE_CRIT", float)],
+    ("ica_final", "defaults", "flatline_crit"): [(s11, "FLATLINE_CRIT", _crit)],
+    ("ica_final", "defaults", "channel_crit"): [(s11, "CHANNEL_CRIT", _crit)],
+    ("ica_final", "defaults", "line_crit"): [(s11, "LINE_NOISE_CRIT", _crit)],
     ("ica_final", "defaults", "iclabel_thresh"): [(s11, "ICLABEL_THRESH", float)],
     ("ica_final", "defaults", "burst_crit"): [(s11, "ASR_BURST_CRIT", _burst)],
     ("ica_final", "defaults", "ica_hp_hz"): [(s11, "ICA_HP_HZ", float), (s10, "ICA_HP_HZ", float)],
     ("ica_final", "guards", "min_iclabel_thresh"): [(s11, "GUARD_MIN_ICLABEL_THRESH", float)],
-    ("ica_final", "guards", "min_channel_crit"): [(s11, "GUARD_MIN_CHANNEL_CRIT", float)],
+    ("ica_final", "guards", "max_channel_crit"): [(s11, "GUARD_MAX_CHANNEL_CRIT", _crit)],
+    ("ica_final", "guards", "min_channel_crit"): [(s11, "GUARD_MAX_CHANNEL_CRIT", _crit)],
     ("ica_final", "guards", "min_burst_crit"): [(s11, "GUARD_MIN_BURST_CRIT", float)],
 }
 
@@ -274,6 +282,8 @@ class SegPaths:
         deriv = DATA_ROOT / sid / "derivatives"
         self.in_set = self.seg_dir / f"{seg}{IN_SUFFIX}.set"
         self.prebcg_dir = deriv / "02_resampled250" / seg
+        self.resamp_fif = self.prebcg_dir / f"{seg}_250hz.fif"
+        self.bergen_fif = deriv / "01_bergen_250hz" / seg / f"{seg}_bergen_250hz_eeg.fif"
         self.bcg_dir = deriv / "03_bcg" / seg
         self.bcg_fif = self.bcg_dir / f"{seg}_bcg_clean.fif"
         self.bcg_html = self.bcg_dir / f"{seg}_bcg_report.html"
@@ -306,6 +316,7 @@ def _load_state(sp: SegPaths) -> dict:
 
 
 def _save_state(sp: SegPaths, state: dict):
+    sp.state.parent.mkdir(parents=True, exist_ok=True)
     sp.state.write_text(json.dumps(state, indent=2, default=str))
 
 
@@ -331,11 +342,12 @@ def decide(sp: SegPaths, step: str, upstream_mtime: float, forced: bool,
 def run_bcg(sp: SegPaths, cfg: dict):
     fixed = _get(cfg, ("bcg", "fixed_npc"))
     npc_grid = [int(fixed)] if fixed else list(s08.NPC_GRID)
-    s08.run_bcg_pipeline(sp.seg_dir, npc_grid=npc_grid, force=True, input_set=sp.in_set)
+    in_set_path = sp.in_set if sp.in_set.exists() else None
+    s08.run_bcg_pipeline(sp.seg_dir, npc_grid=npc_grid, force=True, input_set=in_set_path)
 
 
 def run_ica_opt(sp: SegPaths, cfg: dict):
-    s10.run_optuna_ica(sp.seg_dir, force=False)
+    s10.run_optuna_ica(sp.seg_dir, force=True)
 
 
 def ica_final_override(cfg: dict) -> dict:
@@ -344,9 +356,11 @@ def ica_final_override(cfg: dict) -> dict:
     if not fin.get("use_optimized_params", True):
         override.update(fin.get("defaults") or {})
     override.update(fin.get("force_params") or {})
-    if "burst_crit" in override:
-        override["burst_crit"] = _burst(override["burst_crit"])
-    return {k: (v if k == "burst_crit" else float(v)) for k, v in override.items() if k in ICA_PARAM_KEYS}
+    for k in ("burst_crit", "channel_crit", "flatline_crit", "line_crit"):
+        if k in override:
+            override[k] = _crit(override[k])
+    return {k: (override[k] if k in ("burst_crit", "channel_crit", "flatline_crit", "line_crit") else float(override[k]))
+            for k in override if k in ICA_PARAM_KEYS}
 
 
 def run_ica_final(sp: SegPaths, cfg: dict):
@@ -357,6 +371,7 @@ def run_ica_final(sp: SegPaths, cfg: dict):
 
 def export_set(sp: SegPaths):
     """Write the final ICA-clean data as a minimal EEGLAB .set (µV, data inline)."""
+    sp.ica_set.parent.mkdir(parents=True, exist_ok=True)
     raw = mne.io.read_raw_fif(sp.ica_fif, preload=True, verbose=False)
     data_uv = (raw.get_data() * 1e6).astype(np.float32)
     nbchan, pnts = data_uv.shape
@@ -488,10 +503,13 @@ def process_segment(sid: str, seg: str, cfg_all: dict, cli_force: set, dry_run: 
     cfg = effective_config(cfg_all, sid, seg)
     t0 = time.time()
     row = {"subject": sid, "segment": seg, "status": "", "minutes": 0.0}
-    if not sp.in_set.exists():
-        row.update(status="no_input", qc="INCOMPLETE", error=f"{sp.in_set.name} missing (run cleanP01)")
-        print(f"  [SKIP] {sid}/{seg}: {sp.in_set.name} not found.")
+    has_input = sp.in_set.exists() or sp.resamp_fif.exists() or sp.bergen_fif.exists() or sp.bcg_fif.exists()
+    if not has_input:
+        row.update(status="no_input", qc="INCOMPLETE", error=f"Input data missing for {sid}/{seg} (run cleanP01)")
+        print(f"  [SKIP] {sid}/{seg}: input not found.")
         return row
+
+    sp.seg_dir.mkdir(parents=True, exist_ok=True)
 
     apply_to_modules(cfg)
     steps_on = {s: bool(_get(cfg, ("run", "steps", s), True)) for s in STEPS}
@@ -500,7 +518,8 @@ def process_segment(sid: str, seg: str, cfg_all: dict, cli_force: set, dry_run: 
     use_opt = bool(_get(cfg, ("ica_final", "use_optimized_params"), True))
     state = _load_state(sp)
 
-    upstream = {"bcg": _mtime(sp.in_set)}
+    in_mtime = max(_mtime(sp.in_set), _mtime(sp.resamp_fif), _mtime(sp.bergen_fif))
+    upstream = {"bcg": in_mtime}
     ran = []
     for step in STEPS:
         if step == "ica_opt":
@@ -546,7 +565,12 @@ def process_segment(sid: str, seg: str, cfg_all: dict, cli_force: set, dry_run: 
 
 def discover_subjects() -> list[str]:
     return sorted(d.name for d in DATA_ROOT.iterdir()
-                  if d.is_dir() and any((d / "segments").glob(f"*/*{IN_SUFFIX}.set")))
+                  if d.is_dir() and d.name not in ("logs", "copy.sh") and (
+                      any((d / "segments").glob(f"*/*{IN_SUFFIX}.set")) or
+                      (d / "derivatives" / "02_resampled250").exists() or
+                      (d / "derivatives" / "01_bergen_250hz").exists() or
+                      (d / "derivatives" / "03_bcg").exists()
+                  ))
 
 
 class _Tee:
@@ -575,6 +599,7 @@ def main():
                     help="Override a config value, e.g. --set bcg.fixed_npc=4 (repeatable)")
     ap.add_argument("--force", nargs="*", choices=STEPS, default=None,
                     help="Force steps (no names = all steps)")
+    ap.add_argument("--recalc", action="store_true", help="Recalculate all steps (alias for --force)")
     ap.add_argument("--dry-run", action="store_true", help="Only show what would be run")
     ap.add_argument("--report-only", action="store_true", help="Only rebuild the summary from existing outputs")
     args = ap.parse_args()
@@ -582,7 +607,10 @@ def main():
     cfg = load_config(args.config, args.set)
     if args.segments:
         cfg.setdefault("run", {})["segments"] = args.segments
-    cli_force = set(STEPS) if args.force == [] else set(args.force or [])
+    if args.recalc:
+        cli_force = set(STEPS)
+    else:
+        cli_force = set(STEPS) if args.force == [] else set(args.force or [])
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     report_dir = PROJECT_ROOT / (_get(cfg, ("output", "report_dir")) or "reports/cleanP02")
