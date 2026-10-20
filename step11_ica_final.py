@@ -35,8 +35,8 @@ STD_1005 = DIPFIT_DIR / "standard_BEM" / "elec" / "standard_1005.elc"
 
 # Rule-2 cutoff: reject an 'Other'-dominant IC only if P(Brain) < this value.
 OTHER_BRAIN_MAX = ICLABEL_OTHER_BRAIN_MAX
-# Optional cap on the number of ICA components (None = reduce only if rank-deficient).
-ICA_PCA_MAX = None
+# Optional cap on the number of ICA components (35 components optimal for ~95 ch).
+ICA_PCA_MAX = 35
 # Safety guards against over-cleaning.
 GUARD_MIN_ICLABEL_THRESH = 0.65   # -> clamped to 0.80 if lower
 GUARD_MAX_CHANNEL_CRIT = 0.70     # -> clamped to 0.70 if higher (higher ChannelCriterion = more aggressive deletion)
@@ -251,7 +251,7 @@ EEG_clean = pop_clean_rawdata(EEG, ...
     'Distance', 'Euclidian');
 
 pop_saveset(EEG_clean, 'filename', 'temp_clean.set', 'filepath', '{work_dir.resolve().as_posix()}');
-quit force;
+try, java.lang.System.exit(0); catch, exit(0); end
 """
     m_file1 = work_dir / "step11_part1.m"
     with open(m_file1, "w", encoding="ascii") as f:
@@ -291,16 +291,35 @@ quit force;
         ic_classes = iclabel_label_components(raw_for_ica, ica)
 
         # Balanced rejection rule for EEG-fMRI:
-        artifact_cols = [1, 2, 3, 4, 5]
-        reject_ic_list = []
+        # Classes: 0: Brain, 1: Muscle, 2: Eye, 3: Heart, 4: Line, 5: Chan, 6: Other
+        candidate_rejects = []
         for c in range(n_pca):
             probs = ic_classes[c]
             dominant = int(np.argmax(probs))
             max_prob = float(probs[dominant])
             brain_prob = float(probs[0])
-            if (dominant in artifact_cols and max_prob >= iclabel_thresh) or (dominant == 6 and brain_prob < OTHER_BRAIN_MAX):
-                reject_ic_list.append(c)
+            is_rej = False
 
+            if dominant == 2 and max_prob >= min(0.70, iclabel_thresh):  # Eye (blinks/saccades)
+                is_rej = True
+            elif dominant == 3 and max_prob >= min(0.70, iclabel_thresh):  # Heart (residual BCG)
+                is_rej = True
+            elif dominant in (4, 5) and max_prob >= iclabel_thresh:  # Line or Channel noise
+                is_rej = True
+            elif dominant == 1 and max_prob >= max(0.80, iclabel_thresh) and brain_prob < 0.10:  # High-confidence Muscle
+                is_rej = True
+
+            if is_rej:
+                candidate_rejects.append((c, max_prob - brain_prob))
+
+        # Over-cleaning guard: cap rejection at 35% of components
+        max_allowed = max(1, int(0.35 * n_pca))
+        if len(candidate_rejects) > max_allowed:
+            candidate_rejects.sort(key=lambda x: x[1], reverse=True)
+            print(f"    [GUARD] Capping rejected ICs from {len(candidate_rejects)} to {max_allowed} (top confidence)")
+            candidate_rejects = candidate_rejects[:max_allowed]
+
+        reject_ic_list = sorted([c for c, _ in candidate_rejects])
         n_ic_rejected = len(reject_ic_list)
         n_ic = n_pca
         print(f"  ICs rejected: {n_ic_rejected} / {n_ic} ({reject_ic_list})")
@@ -384,20 +403,34 @@ n_ic = size(EEG_clean.icaweights, 1);
 EEG_clean = pop_iclabel(EEG_clean, 'default');
 ic_classes = EEG_clean.etc.ic_classification.ICLabel.classifications;
 
-artifact_cols = [2, 3, 4, 5, 6];
 rej_mask = false(1, n_ic);
+conf = zeros(1, n_ic);
 for c = 1:n_ic
     probs = ic_classes(c, :);
     [max_prob, dominant] = max(probs);
     brain_prob = probs(1);
-    if any(dominant == artifact_cols) && max_prob >= {iclabel_thresh}
-        rej_mask(c) = true;
+    is_rej = false;
+    if (dominant == 3) && max_prob >= min(0.70, {iclabel_thresh})
+        is_rej = true;
+    elseif (dominant == 4) && max_prob >= min(0.70, {iclabel_thresh})
+        is_rej = true;
+    elseif (dominant == 5 || dominant == 6) && max_prob >= {iclabel_thresh}
+        is_rej = true;
+    elseif (dominant == 2) && max_prob >= max(0.80, {iclabel_thresh}) && brain_prob < 0.10
+        is_rej = true;
     end
-    if dominant == 7 && brain_prob < {float(OTHER_BRAIN_MAX)}
+    if is_rej
         rej_mask(c) = true;
+        conf(c) = max_prob - brain_prob;
     end
 end
 reject_ic_list = find(rej_mask);
+max_allowed = max(1, floor(0.35 * n_ic));
+if length(reject_ic_list) > max_allowed
+    [~, sort_idx] = sort(conf(reject_ic_list), 'descend');
+    reject_ic_list = reject_ic_list(sort_idx(1:max_allowed));
+    reject_ic_list = sort(reject_ic_list);
+end
 n_ic_rejected = length(reject_ic_list);
 
 if n_ic_rejected > 0

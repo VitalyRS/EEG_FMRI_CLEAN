@@ -105,8 +105,8 @@ BRAIN_IDX = 0
 # Rule-2 cutoff: reject an 'Other'-dominant IC only if P(Brain) < this value.
 OTHER_BRAIN_MAX = ICLABEL_OTHER_BRAIN_MAX
 # Optional cap on the number of ICA components (PCA reduction before runica).
-# None = only reduce when the data is rank-deficient (original behaviour).
-ICA_PCA_MAX = None
+# 35 components is optimal for ~95 channels in EEG-fMRI to avoid component splitting.
+ICA_PCA_MAX = 35
 # High-pass filter exclusively for ICA training (Hz).
 ICA_HP_HZ = 1.0
 # ICLabel backend: "python" (mne-icalabel, recommended) or "matlab"
@@ -700,29 +700,44 @@ def load_phase2_cache(work_dir: Path) -> dict | None:
 def decide_rejected_ics(ic_classes: np.ndarray, thresh: float) -> np.ndarray:
     """
     Balanced rejection rule for EEG-fMRI data (0-based class indices).
-
-    Reject an IC when:
-      1. Its dominant class is a confident artifact (Muscle/Eye/Heart/Line/Chan)
-         AND probability >= thresh, OR
-      2. It's classified as "Other" (residual fMRI noise that ICLabel doesn't
-         recognize) AND ICLabel is 98% certain it's NOT brain (brain_prob < 0.02).
-
-    This gives ~37% rejection (target 20-40%) while preserving 91% of alpha
-    rhythm. Rule (2) cleans residual gradient/BCG noise that standard ICLabel
-    can't name, but only when the classifier is absolutely confident it's not
-    neural activity.
+    Classes: 0: Brain, 1: Muscle, 2: Eye, 3: Heart, 4: Line, 5: Chan, 6: Other
     """
     dominant = np.argmax(ic_classes, axis=1)
     max_prob = np.max(ic_classes, axis=1)
     brain_prob = ic_classes[:, BRAIN_IDX]
+    n_ic = len(dominant)
 
-    # Rule 1: confident artifacts
-    is_artifact = np.isin(dominant, ARTIFACT_IDX) & (max_prob >= thresh)
+    reject = np.zeros(n_ic, dtype=bool)
+    confidence = np.zeros(n_ic, dtype=float)
 
-    # Rule 2: "Other" with near-zero brain probability
-    is_other_nonbrain = (dominant == OTHER_IDX) & (brain_prob < OTHER_BRAIN_MAX)
+    for c in range(n_ic):
+        dom = dominant[c]
+        p_max = max_prob[c]
+        p_brain = brain_prob[c]
 
-    return is_artifact | is_other_nonbrain
+        is_rej = False
+        if dom == 2 and p_max >= min(0.70, thresh):  # Eye
+            is_rej = True
+        elif dom == 3 and p_max >= min(0.70, thresh):  # Heart
+            is_rej = True
+        elif dom in (4, 5) and p_max >= thresh:  # Line or Channel
+            is_rej = True
+        elif dom == 1 and p_max >= max(0.80, thresh) and p_brain < 0.10:  # High-confidence Muscle
+            is_rej = True
+
+        if is_rej:
+            reject[c] = True
+            confidence[c] = p_max - p_brain
+
+    # Safety guard: clamp to at most 35% of components to prevent over-cleaning
+    max_allowed = max(1, int(0.35 * n_ic))
+    if np.sum(reject) > max_allowed:
+        rej_indices = np.where(reject)[0]
+        sorted_indices = rej_indices[np.argsort(-confidence[rej_indices])]
+        reject = np.zeros(n_ic, dtype=bool)
+        reject[sorted_indices[:max_allowed]] = True
+
+    return reject
 
 
 def reconstruct_without_ics(ica: dict, reject_mask: np.ndarray) -> np.ndarray:

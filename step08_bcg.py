@@ -493,7 +493,7 @@ def run_bcg_pipeline(segment_dir: Path = DEFAULT_SEGMENT_DIR, npc_grid=None, for
         d.mkdir(parents=True, exist_ok=True)
 
     resamp_fif = resamp_dir / f"{seg_name}_250hz.fif"
-    if resamp_fif.exists() and not input_set:
+    if resamp_fif.exists() and not force and not input_set:
         print(f"  Found pre-existing resampled 250 Hz data: {resamp_fif.name}, loading directly...")
         raw_rs = mne.io.read_raw_fif(resamp_fif, preload=True, verbose=False)
     else:
