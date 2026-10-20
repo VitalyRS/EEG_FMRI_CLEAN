@@ -364,9 +364,15 @@ def ica_final_override(cfg: dict) -> dict:
 
 
 def run_ica_final(sp: SegPaths, cfg: dict):
-    s11.apply_optimized_ica(sp.seg_dir, force=True, params_override=ica_final_override(cfg) or None)
+    s11.apply_optimized_ica(sp.seg_dir, force=True, params_override=ica_final_override(cfg) or None, cfg_snapshot=cfg)
     if _get(cfg, ("output", "export_set"), True):
         export_set(sp)
+    s11.save_pipeline_info(
+        sp.sid, sp.seg, sp.ica_dir, in_fif=sp.bcg_fif, out_fif=sp.ica_fif,
+        metrics=_read_json(sp.ica_metrics),
+        params_used=_read_json(sp.ica_metrics).get("params_used", {}),
+        cfg=cfg
+    )
 
 
 def export_set(sp: SegPaths):

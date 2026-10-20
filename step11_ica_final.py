@@ -14,6 +14,8 @@ from scipy.signal import welch
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import datetime
+import yaml
 
 try:
     from .config import (MATLAB_BIN, EEGLAB_DIR, PROJECT_ROOT, DEFAULT_SEGMENT_DIR, ALPHA_BAND, EVAL_CHANNELS,
@@ -59,8 +61,103 @@ def _find_bcg_fif(segment_dir: Path) -> Path:
     return p
 
 
+def get_git_info() -> dict:
+    info = {
+        "branch": "unknown",
+        "commit_hash": "unknown",
+        "commit_short": "unknown",
+        "commit_message": "unknown",
+        "commit_date": "unknown",
+        "is_dirty": False,
+    }
+    for cmd, key in [
+        (["git", "rev-parse", "--abbrev-ref", "HEAD"], "branch"),
+        (["git", "rev-parse", "HEAD"], "commit_hash"),
+        (["git", "log", "-1", "--format=%s"], "commit_message"),
+        (["git", "log", "-1", "--format=%ci"], "commit_date"),
+    ]:
+        try:
+            res = subprocess.run(cmd, cwd=PROJECT_ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+            info[key] = res.stdout.strip()
+        except Exception:
+            pass
+    if info["commit_hash"] != "unknown":
+        info["commit_short"] = info["commit_hash"][:7]
+    try:
+        res = subprocess.run(["git", "status", "--porcelain"], cwd=PROJECT_ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        info["is_dirty"] = bool(res.stdout.strip())
+    except Exception:
+        info["is_dirty"] = False
+    return info
+
+
+def save_pipeline_info(subject_id: str, seg: str, out_deriv_dir: Path,
+                       in_fif: Path, out_fif: Path, metrics: dict,
+                       params_used: dict, cfg: dict | None = None) -> Path:
+    """Save pipeline_info.yaml containing git info, data provenance and config snapshot."""
+    out_deriv_dir = Path(out_deriv_dir).resolve()
+    info_path = out_deriv_dir / "pipeline_info.yaml"
+
+    if cfg is None:
+        cfg_file = PROJECT_ROOT / "config" / "cleanP02.yaml"
+        if cfg_file.exists():
+            try:
+                cfg = yaml.safe_load(cfg_file.read_text(encoding="utf-8")) or {}
+            except Exception:
+                cfg = {}
+        else:
+            cfg = {}
+
+    git_info = get_git_info()
+
+    def _rel(p: Path | str | None) -> str | None:
+        if not p:
+            return None
+        p = Path(p).resolve()
+        try:
+            return str(p.relative_to(PROJECT_ROOT.resolve()))
+        except ValueError:
+            return str(p)
+
+    source_set = DATA_ROOT / subject_id / "segments" / seg / f"{seg}_bergen_250hz.set"
+    source_fif = DATA_ROOT / subject_id / "derivatives" / "01_bergen_250hz" / seg / f"{seg}_bergen_250hz_eeg.fif"
+    out_set = out_deriv_dir / f"{seg}_ica_clean.set"
+    out_html = out_deriv_dir / f"{seg}_ica_report.html"
+    out_metrics = out_deriv_dir / f"{seg}_ica_metrics.json"
+
+    input_source = _rel(source_set) if source_set.exists() else (_rel(source_fif) if source_fif.exists() else None)
+
+    provenance = {
+        "input_source_250hz": input_source,
+        "input_bcg_fif": _rel(in_fif) if Path(in_fif).exists() else _rel(in_fif),
+        "output_dir": _rel(out_deriv_dir),
+        "output_clean_fif": _rel(out_fif),
+        "output_clean_set": _rel(out_set) if out_set.exists() else None,
+        "output_report_html": _rel(out_html) if out_html.exists() else None,
+        "output_metrics_json": _rel(out_metrics) if out_metrics.exists() else None,
+    }
+
+    payload = {
+        "generated_at": datetime.datetime.now().isoformat(),
+        "subject": str(subject_id),
+        "segment": str(seg),
+        "git": git_info,
+        "provenance": provenance,
+        "metrics": metrics,
+        "params_used": params_used,
+        "config": cfg,
+    }
+
+    out_deriv_dir.mkdir(parents=True, exist_ok=True)
+    with open(info_path, "w", encoding="utf-8") as f:
+        yaml.dump(payload, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+
+    print(f"  Saved pipeline provenance: {info_path}")
+    return info_path
+
+
 def apply_optimized_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, force: bool = False,
-                        params_override: dict | None = None):
+                        params_override: dict | None = None, cfg_snapshot: dict | None = None):
     """params_override: values that replace the step10-optimized ones
     (keys: flatline_crit, channel_crit, line_crit, iclabel_thresh, burst_crit)."""
     segment_dir = Path(segment_dir).resolve()
@@ -562,6 +659,10 @@ exit(0);
     print("\n  Generating QC plots & report...")
     generate_ica_report(data, after_data, ch_names, sfreq, ic_classes,
                         reject_ic_list, removed_chans_list, metrics, seg, subject_id)
+
+    # Save pipeline provenance YAML
+    save_pipeline_info(subject_id, seg, out_deriv_dir, in_fif=fif, out_fif=out_fif,
+                       metrics=metrics, params_used=best, cfg=cfg_snapshot)
 
     print("\n" + "=" * 80)
     print(f"[STEP 11] ICA Complete! Output: {out_fif.name}")
