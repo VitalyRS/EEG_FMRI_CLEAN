@@ -629,7 +629,10 @@ def main():
     if any("invalid" in w for w in warns):
         raise SystemExit("Config has invalid values, aborting.")
 
-    subjects = discover_subjects() if args.all else [str(s) for s in args.subjects]
+    if args.all or (args.subjects and len(args.subjects) == 1 and args.subjects[0].lower() == "all"):
+        subjects = discover_subjects()
+    else:
+        subjects = [str(s) for s in args.subjects]
     segments = _get(cfg, ("run", "segments")) or SEGMENT_ORDER
     print(f"[cleanP02] config={args.config}  subjects={subjects}  segments={segments}  "
           f"force={sorted(cli_force) or '-'}")

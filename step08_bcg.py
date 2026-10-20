@@ -75,8 +75,10 @@ def _find_bergen_set(segment_dir: Path) -> Path:
     """Search for a Bergen-cleaned .set in segment_dir or derivatives/01_bergen."""
     candidates = list(segment_dir.glob("*bergen*.set"))
     if not candidates:
-        deriv = DATA_ROOT / DEFAULT_EXPERIMENT / "derivatives" / "01_bergen" / segment_dir.name
-        candidates = list(deriv.glob("*.set"))
+        subject_id = segment_dir.parent.parent.name if segment_dir.parent.name == "segments" else segment_dir.parent.name
+        deriv = DATA_ROOT / subject_id / "derivatives" / "01_bergen" / segment_dir.name
+        if deriv.exists():
+            candidates = list(deriv.glob("*.set"))
     if not candidates:
         raise FileNotFoundError(
             f"No Bergen-cleaned .set found in {segment_dir} or "
@@ -493,27 +495,38 @@ def run_bcg_pipeline(segment_dir: Path = DEFAULT_SEGMENT_DIR, npc_grid=None, for
         d.mkdir(parents=True, exist_ok=True)
 
     resamp_fif = resamp_dir / f"{seg_name}_250hz.fif"
-    if resamp_fif.exists() and not force and not input_set:
+    subject_id = segment_dir.parent.parent.name if segment_dir.parent.name == "segments" else segment_dir.parent.name
+    bergen_fif = DATA_ROOT / subject_id / "derivatives" / "01_bergen_250hz" / seg_name / f"{seg_name}_bergen_250hz_eeg.fif"
+
+    if resamp_fif.exists():
         print(f"  Found pre-existing resampled 250 Hz data: {resamp_fif.name}, loading directly...")
         raw_rs = mne.io.read_raw_fif(resamp_fif, preload=True, verbose=False)
-    else:
-        # 1. Load Bergen-cleaned .set
-        set_path = Path(input_set) if input_set else _find_bergen_set(segment_dir)
-        print(f"  Loading Bergen-clean: {set_path.name} ({set_path.stat().st_size/1e6:.0f} MB)")
+        if force:
+            print(f"  Re-applying band-pass filter ({FILTER_HP}-{FILTER_LP} Hz)...")
+            raw_rs = bandpass_raw(raw_rs, FILTER_HP, FILTER_LP)
+            raw_rs.save(resamp_fif, overwrite=True, verbose=False)
+    elif bergen_fif.exists():
+        print(f"  Found 250 Hz Bergen data: {bergen_fif.name}, loading...")
+        raw_rs = mne.io.read_raw_fif(bergen_fif, preload=True, verbose=False)
+        raw_rs = bandpass_raw(raw_rs, FILTER_HP, FILTER_LP)
+        raw_rs.save(resamp_fif, overwrite=True, verbose=False)
+        print(f"  Saved resampled+filtered: {resamp_fif}")
+    elif input_set and Path(input_set).exists():
+        set_path = Path(input_set)
+        print(f"  Loading input .set: {set_path.name}")
         raw = _load_set_as_raw(set_path)
-        print(f"  {len(raw.ch_names)} channels @ {raw.info['sfreq']:.0f} Hz, {raw.n_times} samples")
-
-        # 2. Resample -> 250 Hz, then band-pass EEG (1-100 Hz). The high-pass is
-        #    essential: without it sub-1 Hz drift dominates the low band, OBS smears
-        #    its subtraction across 0.7-15 Hz (eating alpha) and the metric is noisy.
         raw_rs = resample_raw(raw, TARGET_SFREQ)
         del raw; gc.collect()
-        # Band-pass EEG to FILTER_LP (45 Hz). The low-pass removes the MRI helium-pump
-        # vibration comb (a 1-Hz-spaced harmonic comb spanning 44-100 Hz that Bergen
-        # AAS leaves untouched because it is not gradient-locked). ZapLine was tried
-        # and rejected: it only targets a single mains line (50 Hz) and removed <5%
-        # of this broadband comb. Gamma (>45 Hz) is sacrificed but is buried in the
-        # artifact anyway.
+        raw_rs = bandpass_raw(raw_rs, FILTER_HP, FILTER_LP)
+        raw_rs.save(resamp_fif, overwrite=True, verbose=False)
+        print(f"  Saved resampled+filtered: {resamp_fif}")
+    else:
+        # Fallback to searching 5000 Hz Bergen .set
+        set_path = _find_bergen_set(segment_dir)
+        print(f"  Loading Bergen-clean: {set_path.name} ({set_path.stat().st_size/1e6:.0f} MB)")
+        raw = _load_set_as_raw(set_path)
+        raw_rs = resample_raw(raw, TARGET_SFREQ)
+        del raw; gc.collect()
         raw_rs = bandpass_raw(raw_rs, FILTER_HP, FILTER_LP)
         raw_rs.save(resamp_fif, overwrite=True, verbose=False)
         print(f"  Saved resampled+filtered: {resamp_fif}")
