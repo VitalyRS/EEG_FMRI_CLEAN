@@ -248,7 +248,8 @@ def apply_optimized_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, force: bool = F
     raw = mne.io.read_raw_fif(fif, preload=True, verbose=False)
     sfreq = float(raw.info["sfreq"])
 
-    # Drop ECG channel (it was used in BCG stage, not for ICA)
+    # Extract ECG signal if available for ECG-guided residual BCG classification
+    ecg_data = raw.get_data(picks="ECG")[0] if "ECG" in raw.ch_names else None
     eeg_ch_names = [ch for ch in raw.ch_names if ch != "ECG"]
     raw.pick_channels(eeg_ch_names)
     data = raw.get_data()
@@ -387,6 +388,20 @@ try, java.lang.System.exit(0); catch, exit(0); end
         print("  [Part 3] Running ICLabel classification (mne-icalabel)...")
         ic_classes = iclabel_label_components(raw_for_ica, ica)
 
+        # Check cross-correlation with ECG to reliably detect residual BCG components
+        ecg_corrs = np.zeros(n_pca)
+        if ecg_data is not None:
+            sources = ica.get_sources(raw_clean).get_data()
+            min_len = min(sources.shape[1], len(ecg_data))
+            e = ecg_data[:min_len] - np.mean(ecg_data[:min_len])
+            e_std = np.std(e)
+            if e_std > 1e-12:
+                for c in range(n_pca):
+                    s = sources[c, :min_len] - np.mean(sources[c, :min_len])
+                    s_std = np.std(s)
+                    if s_std > 1e-12:
+                        ecg_corrs[c] = abs(float(np.dot(s, e) / (min_len * s_std * e_std)))
+
         # Balanced rejection rule for EEG-fMRI:
         # Classes: 0: Brain, 1: Muscle, 2: Eye, 3: Heart, 4: Line, 5: Chan, 6: Other
         candidate_rejects = []
@@ -397,20 +412,24 @@ try, java.lang.System.exit(0); catch, exit(0); end
             brain_prob = float(probs[0])
             is_rej = False
 
-            if dominant == 2 and max_prob >= min(0.70, iclabel_thresh):  # Eye (blinks/saccades)
+            if dominant == 2 and max_prob >= min(0.70, iclabel_thresh) and brain_prob < 0.20:  # Eye (blinks/saccades)
                 is_rej = True
-            elif dominant == 3 and max_prob >= min(0.70, iclabel_thresh):  # Heart (residual BCG)
+            elif dominant == 3 and max_prob >= min(0.70, iclabel_thresh) and brain_prob < 0.20:  # Heart (residual BCG)
                 is_rej = True
-            elif dominant in (4, 5) and max_prob >= iclabel_thresh:  # Line or Channel noise
+            elif ecg_corrs[c] >= 0.25 and brain_prob < 0.20:  # ECG-guided BCG residual
+                is_rej = True
+                print(f"    [ECG-GUIDED] IC {c:02d}: Residual BCG detected (r_ECG={ecg_corrs[c]:.3f}, P_brain={brain_prob:.2f})")
+            elif dominant in (4, 5) and max_prob >= max(0.75, iclabel_thresh) and brain_prob < 0.15:  # Line or Channel noise
                 is_rej = True
             elif dominant == 1 and max_prob >= max(0.80, iclabel_thresh) and brain_prob < 0.10:  # High-confidence Muscle
                 is_rej = True
 
             if is_rej:
-                candidate_rejects.append((c, max_prob - brain_prob))
+                conf_score = max_prob - brain_prob + 0.5 * ecg_corrs[c]
+                candidate_rejects.append((c, conf_score))
 
-        # Over-cleaning guard: cap rejection at 35% of components
-        max_allowed = max(1, int(0.35 * n_pca))
+        # Over-cleaning guard: cap rejection at 20% of components (max ~7 out of 35)
+        max_allowed = max(1, int(0.20 * n_pca))
         if len(candidate_rejects) > max_allowed:
             candidate_rejects.sort(key=lambda x: x[1], reverse=True)
             print(f"    [GUARD] Capping rejected ICs from {len(candidate_rejects)} to {max_allowed} (top confidence)")
@@ -420,6 +439,10 @@ try, java.lang.System.exit(0); catch, exit(0); end
         n_ic_rejected = len(reject_ic_list)
         n_ic = n_pca
         print(f"  ICs rejected: {n_ic_rejected} / {n_ic} ({reject_ic_list})")
+        classes_names = ["Brain", "Muscle", "Eye", "Heart", "Line", "Chan", "Other"]
+        for c in reject_ic_list:
+            dom_idx = int(np.argmax(ic_classes[c]))
+            print(f"    - IC {c:02d}: {classes_names[dom_idx]} (prob={ic_classes[c][dom_idx]:.2f}, Brain={ic_classes[c][0]:.2f})")
 
         # Exclude artifact ICs from the cleaned dataset
         ica.exclude = reject_ic_list
@@ -507,11 +530,11 @@ for c = 1:n_ic
     [max_prob, dominant] = max(probs);
     brain_prob = probs(1);
     is_rej = false;
-    if (dominant == 3) && max_prob >= min(0.70, {iclabel_thresh})
+    if (dominant == 3) && max_prob >= min(0.70, {iclabel_thresh}) && brain_prob < 0.20
         is_rej = true;
-    elseif (dominant == 4) && max_prob >= min(0.70, {iclabel_thresh})
+    elseif (dominant == 4) && max_prob >= min(0.70, {iclabel_thresh}) && brain_prob < 0.20
         is_rej = true;
-    elseif (dominant == 5 || dominant == 6) && max_prob >= {iclabel_thresh}
+    elseif (dominant == 5 || dominant == 6) && max_prob >= {iclabel_thresh} && brain_prob < 0.15
         is_rej = true;
     elseif (dominant == 2) && max_prob >= max(0.80, {iclabel_thresh}) && brain_prob < 0.10
         is_rej = true;
@@ -522,7 +545,7 @@ for c = 1:n_ic
     end
 end
 reject_ic_list = find(rej_mask);
-max_allowed = max(1, floor(0.35 * n_ic));
+max_allowed = max(1, floor(0.20 * n_ic));
 if length(reject_ic_list) > max_allowed
     [~, sort_idx] = sort(conf(reject_ic_list), 'descend');
     reject_ic_list = reject_ic_list(sort_idx(1:max_allowed));

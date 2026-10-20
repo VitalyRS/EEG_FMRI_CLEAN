@@ -109,6 +109,7 @@ PARAM_MAP: dict[tuple, list] = {
     ("filter", "lp"): [(s08, "FILTER_LP", float)],
     ("bcg", "npc_grid"): [(s08, "NPC_GRID", _ints)],
     ("bcg", "alpha_gate_min"): [(s08, "ALPHA_GATE_MIN", float)],
+    ("bcg", "min_cardiac_suppr"): [(s08, "MIN_CARDIAC_SUPPR", float)],
     ("bcg", "alpha_warn_min"): [(s08, "ALPHA_WARN_MIN", float)],
     ("bcg", "cardiac_band"): [(s08, "CARDIAC_BAND", _band)],
     ("bcg", "pilot_channels"): [(s08, "PILOT_CHANNELS", _strs)],

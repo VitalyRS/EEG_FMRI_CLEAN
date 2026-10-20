@@ -48,6 +48,7 @@ bcg:
   npc_grid: [1, 2, 3]   # перебираемое число PCA-компонент OBS (<=3 сохраняет альфу)
   fixed_npc: null        # число -> не перебирать, использовать только его (быстрее)
   alpha_gate_min: 0.75   # npc допустим, только если сохраняет >= 75% альфы
+  min_cardiac_suppr: 0.20 # минимально требуемое кардио-подавление (20%)
   alpha_warn_min: 0.60   # ниже — флаг REVIEW в отчёте
   cardiac_band: [0.7, 4.0]
   # Каналы для выбора npc (фронтальные — сильный BCG, затылочные — альфа)
@@ -139,13 +140,43 @@ qc:
 # (порядок применения: segments -> subjects -> subject_segments)
 # -----------------------------------------------------------------------------
 overrides:
-  segments: {}
-    # пример: в задачах с движением ASR нужнее
-    # lasertag:
-    #   ica_opt: {burst_grid: ["off", 30.0, 20.0, 15.0]}
+  segments:
+    video:
+      bcg:
+        alpha_gate_min: 0.50
+      ica_final:
+        defaults:
+          burst_crit: 30.0
+      qc:
+        min_bcg_alpha_retention: 0.50
+    drone:
+      bcg:
+        alpha_gate_min: 0.55
+      ica_final:
+        defaults:
+          burst_crit: 25.0
+      qc:
+        min_bcg_alpha_retention: 0.50
+    lasertag:
+      bcg:
+        alpha_gate_min: 0.55
+      ica_final:
+        defaults:
+          burst_crit: 25.0
+      qc:
+        min_bcg_alpha_retention: 0.50
+    eo:
+      bcg:
+        alpha_gate_min: 0.60
+      qc:
+        min_bcg_alpha_retention: 0.55
+    ec:
+      bcg:
+        alpha_gate_min: 0.75
+      ica_final:
+        defaults:
+          burst_crit: "off"
+      qc:
+        min_bcg_alpha_retention: 0.60
   subjects: {}
-    # "1921":
-    #   bcg: {fixed_npc: 3}
   subject_segments: {}
-    # "1916/drone":
-    #   ica_final: {force_params: {burst_crit: 20.0}}

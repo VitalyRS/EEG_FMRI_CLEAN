@@ -716,11 +716,11 @@ def decide_rejected_ics(ic_classes: np.ndarray, thresh: float) -> np.ndarray:
         p_brain = brain_prob[c]
 
         is_rej = False
-        if dom == 2 and p_max >= min(0.70, thresh):  # Eye
+        if dom == 2 and p_max >= min(0.70, thresh) and p_brain < 0.20:  # Eye
             is_rej = True
-        elif dom == 3 and p_max >= min(0.70, thresh):  # Heart
+        elif dom == 3 and p_max >= min(0.70, thresh) and p_brain < 0.20:  # Heart
             is_rej = True
-        elif dom in (4, 5) and p_max >= thresh:  # Line or Channel
+        elif dom in (4, 5) and p_max >= max(0.75, thresh) and p_brain < 0.15:  # Line or Channel
             is_rej = True
         elif dom == 1 and p_max >= max(0.80, thresh) and p_brain < 0.10:  # High-confidence Muscle
             is_rej = True
@@ -729,8 +729,8 @@ def decide_rejected_ics(ic_classes: np.ndarray, thresh: float) -> np.ndarray:
             reject[c] = True
             confidence[c] = p_max - p_brain
 
-    # Safety guard: clamp to at most 35% of components to prevent over-cleaning
-    max_allowed = max(1, int(0.35 * n_ic))
+    # Safety guard: clamp to at most 20% of components (max ~7 out of 35) to prevent over-cleaning
+    max_allowed = max(1, int(0.20 * n_ic))
     if np.sum(reject) > max_allowed:
         rej_indices = np.where(reject)[0]
         sorted_indices = rej_indices[np.argsort(-confidence[rej_indices])]

@@ -57,6 +57,7 @@ FMRIB_DIR    = EEGLAB_DIR / "plugins" / "fMRIb2.1"
 # npc SELECTION POLICY (OBS -> ICA architecture):
 ALPHA_WARN_MIN = 0.60   # below this, flag REVIEW for a human/QC glance
 ALPHA_GATE_MIN = BCG_ALPHA_GATE_MIN
+MIN_CARDIAC_SUPPR = 0.20 # minimum acceptable cardiac suppression (20%)
 
 
 # Channels used to SCORE each npc. Must be the SAME set used for the final
@@ -573,14 +574,22 @@ def run_bcg_pipeline(segment_dir: Path = DEFAULT_SEGMENT_DIR, npc_grid=None, for
     # the raw max cardiac suppression, which always picked the most aggressive
     # npc and halved the alpha rhythm (e.g. npc=8: cardiac 82%, alpha 53%). BCG
     # is meant to be conservative; residual BCG is left for ICA to remove.
-    eligible = [n for n in sweep if sweep[n]["alpha_retention"] >= ALPHA_GATE_MIN]
+    # 1. Primary: candidates that satisfy both alpha gate and minimum cardiac suppression
+    eligible = [n for n in sweep if sweep[n]["alpha_retention"] >= ALPHA_GATE_MIN and sweep[n]["cardiac_suppression"] >= MIN_CARDIAC_SUPPR]
     if eligible:
         best_npc = max(eligible, key=lambda n: sweep[n]["cardiac_suppression"])
     else:
-        # No npc preserves enough alpha -> fall back to the least destructive one.
-        best_npc = max(sweep, key=lambda n: sweep[n]["alpha_retention"])
-        print(f"  [WARN] No npc keeps alpha >= {ALPHA_GATE_MIN*100:.0f}%; "
-              f"falling back to max-alpha npc={best_npc}.")
+        # 2. If no candidate meets both, check if any candidate meets ALPHA_GATE_MIN with decent suppression (>=15%)
+        alpha_eligible = [n for n in sweep if sweep[n]["alpha_retention"] >= ALPHA_GATE_MIN and sweep[n]["cardiac_suppression"] >= 0.15]
+        if alpha_eligible:
+            best_npc = max(alpha_eligible, key=lambda n: sweep[n]["cardiac_suppression"])
+        else:
+            # 3. Otherwise (e.g. open eyes / visual tasks where BCG harmonics depress 8-13 Hz power):
+            # Select the best composite BSI (balances cardiac suppression, ECG correlation drop, and alpha penalty)
+            best_npc = max(sweep, key=lambda n: sweep[n]["bsi"])
+            print(f"  [NOTE] Fallback to composite BSI selection: picked npc={best_npc} "
+                  f"(BSI={sweep[best_npc]['bsi']:.4f}, cardiac={sweep[best_npc]['cardiac_suppression']*100:.1f}%, "
+                  f"alpha={sweep[best_npc]['alpha_retention']*100:.1f}%).")
     alpha_flag = "OK" if sweep[best_npc]["alpha_retention"] >= ALPHA_WARN_MIN else "REVIEW"
     if alpha_flag == "REVIEW":
         print(f"  [NOTE] alpha retention {sweep[best_npc]['alpha_retention']*100:.1f}% "
