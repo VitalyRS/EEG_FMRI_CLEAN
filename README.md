@@ -35,13 +35,19 @@ Clean 250 Hz EEG Dataset: .fif (MNE) and .set (EEGLAB)
 
 ## 🛡️ Channel Preservation & Gentle Cleaning Policy (New)
 
-Previous versions of EEG cleaning algorithms frequently over-removed channels using aggressive neighbor-correlation criteria (`ChannelCriterion >= 0.80`), which later forced spherical spline interpolation to "hallucinate" missing EEG data and distort scalp topography.
+Previous versions of EEG cleaning algorithms frequently over-removed channels using aggressive neighbor-correlation criteria (`ChannelCriterion >= 0.80`) or over-rejected 60–80% of ICA components, destroying brain variance and alpha rhythm.
 
 **The pipeline now adopts a strict gentle-cleaning protocol:**
 1. **`channel_crit: "off"` by default**: The algorithm does **not** delete channels based on spatial correlation. Channels are preserved intact across all 95 electrodes.
-2. **In-place ASR Reconstruction (`burst_crit: 15.0`)**: High-variance transient bursts (jaw clenches, head motion spikes) are repaired in-place by Artifact Subspace Reconstruction (ASR) with `BurstRejection = 'off'`. No channels are removed and no time intervals are cut.
-3. **Spatial Artifact Cleaning via Picard ICA + ICLabel**: Eye blinks, pulse (BCG residuals), line noise, and muscle artifacts are projected into independent spatial components and subtracted, preserving true sensor topography without spherical interpolation.
-4. **Safety Guards**: If an optimization trial attempts aggressive channel deletion (`channel_crit > 0.70`), safety guards automatically clamp it down.
+2. **PCA Dimensionality Reduction (`ica_pca_max: 35`)**: Stabilizes ICA on ~95 channels by projecting data into the top 35 principal components prior to decomposition. This completely prevents component splitting and keeps independent sources stable.
+3. **Low-Pass Filter (`filter.lp: 45.0 Hz`)**: Effectively cuts the mechanical helium-pump vibration harmonic comb (44–100 Hz), which Bergen AAS cannot eliminate because it is not gradient-locked.
+4. **In-place ASR Reconstruction (`burst_crit: 25.0`)**: High-variance transient bursts (jaw clenches, head motion spikes) are gently repaired in-place by Artifact Subspace Reconstruction (ASR) with `BurstRejection = 'off'`. No channels are removed and no time intervals are cut.
+5. **Balanced ICLabel Rejection Rule**:
+   * Class `Other` is **preserved** (not automatically deleted, protecting non-standard cortical dipoles).
+   * Rejects only confirmed `Eye` (blinks/saccades, $\ge 0.70$), `Heart` (residual BCG, $\ge 0.70$), `Line` / `Channel` noise ($\ge 0.75$), and high-confidence `Muscle` ($P \ge 0.80$ with $P(\text{Brain}) < 0.10$).
+   * **Over-cleaning Guard**: A strict ceiling guarantees that **no more than 35% of components** can ever be rejected.
+6. **Automatic Provenance & Reproducibility (`pipeline_info.yaml`)**:
+   Every cleaned folder (`data/<sid>/derivatives/05_ica/<seg>/`) automatically receives a `pipeline_info.yaml` with the exact Git branch, commit hash, data provenance (input/output paths), cleaning metrics, and full config snapshot.
 
 ---
 
@@ -146,16 +152,18 @@ python cleanP02.py --subjects 1916 --set ica_final.defaults.burst_crit=20.0
 
 | Параметр | Значение | Описание |
 |---|:---:|---|
+| `iclabel.ica_pca_max` | `35` | PCA-редукция до 35 компонент перед ICA: предотвращает расщепление компонент и переочистку |
+| `filter.hp` / `filter.lp` | `1.0` / `45.0` | Полосовой фильтр (45.0 Гц полностью срезает вибрационную гребёнку крионасоса МРТ 44–100 Гц) |
+| `bcg.npc_grid` | `[1, 2, 3]` | Сетка компонент fMRIB OBS ($\le 3$ эффективно убирает пульс и сохраняет альфа-ритм) |
 | `ica_final.defaults.channel_crit` | `"off"` | Отключение удаления каналов по корреляции с соседями (все 95 каналов сохраняются) |
-| `ica_final.defaults.burst_crit` | `15.0` | Порог ASR (SD cutoff): локально восстанавливает всплески движения во времени |
-| `ica_final.defaults.iclabel_thresh` | `0.70` | Порог вероятности ICLabel для удаления артефактных компонент (глаза, сердце, мышцы) |
+| `ica_final.defaults.burst_crit` | `25.0` | Порог ASR (SD cutoff): локально и мягко восстанавливает всплески движения во времени |
+| `ica_final.defaults.iclabel_thresh` | `0.75` | Порог вероятности ICLabel для удаления артефактных компонент |
 | `ica_opt.max_channel_removal_fraction` | `0.05` | Жёсткий лимит: выбрасывать не более 5% каналов (макс ~4–5) |
 | `ica_final.guards.max_channel_crit` | `0.70` | Защита от перечистки: блокирует агрессивные значения порога удаления каналов |
-| `filter.hp` / `filter.lp` | `1.0` / `80.0` | Полосовой фильтр перед BCG и ICA (1.0 Гц устраняет дрейф базовой линии) |
 
 Вы можете переопределять параметры прямо в командной строке:
 ```bash
-python cleanP02.py --subjects 1916 --set bcg.fixed_npc=4 --set ica_final.defaults.burst_crit=20.0
+python cleanP02.py --subjects 1916 --set bcg.fixed_npc=3 --set ica_final.defaults.burst_crit=25.0
 ```
 
 ---
@@ -175,7 +183,12 @@ data/
         ├── 02_resampled250/<seg>/      # Ресемплированные данные 250 Hz (<seg>_250hz.fif)
         ├── 03_bcg/<seg>/               # Шаг 08: BCG-очищенные данные (<seg>_bcg_clean.fif)
         ├── 04_channels/<seg>/          # Шаг 11: removed_channels.json (список удалённых каналов)
-        └── 05_ica/<seg>/               # Шаг 11: Финальные данные (<seg>_ica_clean.fif + .set)
+        └── 05_ica/<seg>/               # Шаг 11: Финальные данные:
+            ├── <seg>_ica_clean.fif     #   - MNE чистые данные
+            ├── <seg>_ica_clean.set     #   - EEGLAB чистые данные
+            ├── <seg>_ica_report.html   #   - Интерактивный HTML-отчёт
+            ├── <seg>_ica_metrics.json  #   - Числовые метрики очистки
+            └── pipeline_info.yaml      #   - Паспорт воспроизводимости (Git коммит, ветка, пути, конфиг)
 ```
 
 ---
@@ -210,26 +223,27 @@ data/
 ### [STEP 08] Удаление баллистокардиограммы (BCG) (`step08_bcg.py`)
 - **Цель**: 
   1. Чтение 250 Гц данных (из `02_resampled250` или даунсэмплинг из 5000 Гц `.set`).
-  2. Полосовой фильтр 1.0–80 Гц (1.0 Гц полностью убирает дыхательный дрейф).
+  2. Полосовой фильтр 1.0–45.0 Гц (1.0 Гц полностью убирает дыхательный дрейф; 45.0 Гц срезает гармоническую гребенку крионасоса томографа).
   3. Детекция QRS-пиков кардиоканала в fMRIB (`fmrib_pas`).
-  4. Подбор оптимального числа компонент базиса (`npc = 1..8`) с контролем сохранения альфа-ритма.
+  4. Подбор оптимального числа компонент базиса (`npc = 1..3`) с контролем сохранения альфа-ритма.
 - Выход: `derivatives/03_bcg/<seg>/<seg>_bcg_clean.fif`.
 
 ### [STEP 10] Быстрая двухфазная оптимизация ICA (`step10_optuna_ica.py`)
 - **Цель**: 
-  - **Фаза 1**: Сетка `clean_rawdata` с приоритетом сохранения каналов (`channel_grid: ["off", 0.50]`).
-  - **Фаза 2**: Однократный запуск Picard ICA на выбранной конфигурации.
-  - **Фаза 3**: Быстрый подбор порога ICLabel (0.65–0.80) в памяти Python.
+  - **Фаза 1**: Сетка `clean_rawdata` с приоритетом сохранения каналов (`channel_grid: ["off"]`).
+  - **Фаза 2**: Однократный запуск Picard ICA с PCA-редукцией до 35 компонент (`ica_pca_max = 35`).
+  - **Фаза 3**: Быстрый подбор порога ICLabel (0.70–0.85) по сбалансированным правилам (сохранение класса Other, удаление подтверждённых артефактов).
 - Выход: `optuna_ica_best_params.json`.
 
 ### [STEP 11] Финальная чистка ICA + ASR (`step11_ica_final.py`)
 - **Цель**: 
-  1. Применение ASR (`BurstCriterion = 15.0`) для реконструкции всплесков во времени без вырезания каналов.
-  2. Picard ICA на всем сегменте.
-  3. Классификация компонент через `mne-icalabel` и удаление артефактов (Eye, Heart, Muscle, Line).
-  4. Сохранение всех каналов в исходном виде (интерполяция вызывается только при реальном наличии физически повреждённых каналов).
+  1. Применение ASR (`BurstCriterion = 25.0`) для мягкой реконструкции всплесков во времени без вырезания каналов.
+  2. Picard ICA с редукцией до 35 компонент на всем сегменте.
+  3. Сбалансированная классификация компонент через `mne-icalabel`: удаление артефактов (Eye, Heart, high-confidence Muscle, Line/Chan), сохранение класса `Other`, и защитный потолок (не более 35% компонент).
+  4. Сохранение всех каналов в исходном виде.
   5. Перевод к общему усреднённому референсу (Average Reference).
-- Выход: `derivatives/05_ica/<seg>/<seg>_ica_clean.fif` и `.set`.
+  6. Экспорт паспорта воспроизводимости `pipeline_info.yaml` (Git коммит, ветка, пути входа/выхода, конфиг).
+- Выход: `derivatives/05_ica/<seg>/<seg>_ica_clean.fif`, `.set`, и `pipeline_info.yaml`.
 
 ### [STEP 12] Сводный многостадийный отчёт (`step12_summary_report.py`)
 - **Цель**: Построение интерактивного дашборда сравнения **Сырая ЭЭГ ➔ Bergen AAS ➔ BCG OBS ➔ Финальная ICA**:
