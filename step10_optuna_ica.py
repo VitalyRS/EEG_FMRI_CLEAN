@@ -38,6 +38,7 @@ from scipy.signal import welch
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import optuna
 
 try:
     from .config import (MATLAB_BIN, EEGLAB_DIR, PROJECT_ROOT,
@@ -585,6 +586,7 @@ quit force;
             "n_ic": n_pca,
             "n_removed": len(removed),
             "removed_chans": removed,
+            "ch_names": kept_labels,
         }
     else:
         # MATLAB fallback
@@ -658,6 +660,7 @@ exit(0);
             "n_ic": int(m["n_ic"][0, 0]),
             "n_removed": len(removed),
             "removed_chans": removed,
+            "ch_names": kept_labels,
         }
 
     # Cache the ICA result
@@ -669,6 +672,7 @@ exit(0);
         pruned_data=ica["pruned_data"], pca_mean=ica.get("pca_mean", np.zeros(1)),
         n_ic=ica["n_ic"], n_removed=ica["n_removed"],
         removed_chans=np.array(removed, dtype=object),
+        ch_names=np.array(ica.get("ch_names", kept_labels), dtype=object),
         best_ch=json.dumps({k: best_ch[k] for k in ("flatline_crit", "channel_crit", "line_crit")}),
     )
     return ica
@@ -689,6 +693,8 @@ def load_phase2_cache(work_dir: Path) -> dict | None:
     }
     if "pca_mean" in d.files:
         out["pca_mean"] = d["pca_mean"]
+    if "ch_names" in d.files:
+        out["ch_names"] = [str(x) for x in d["ch_names"]]
     if "best_ch" in d.files:   # channel params actually used for this ICA
         out["best_ch"] = json.loads(str(d["best_ch"]))
     return out
@@ -742,41 +748,49 @@ def decide_rejected_ics(ic_classes: np.ndarray, thresh: float) -> np.ndarray:
 
 def reconstruct_without_ics(ica: dict, reject_mask: np.ndarray) -> np.ndarray:
     """
-    Zero the rejected ICs and project back to channel space:
-        act        = (icaweights @ icasphere) @ pruned_data
-        act[rej]   = 0
-        data_clean = icawinv @ act
-    Returns cleaned channel-pruned data (V).
+    Subtract rejected ICs from channel space:
+        act = (icaweights @ icasphere) @ (pruned_data - mean)
+        delta = icawinv[:, reject_mask] @ act[reject_mask, :]
+        data_clean = pruned_data - delta
+    This preserves the unreduced orthogonal subspace of channels.
     """
-    unmix = ica["icaweights"] @ ica["icasphere"]        # (n_ic, n_ch)
+    if not np.any(reject_mask):
+        return ica["pruned_data"]
+
+    unmix = ica["icaweights"] @ ica["icasphere"]
     mean = ica.get("pca_mean", None)
     if mean is not None and mean.ndim > 0 and mean.shape[0] == ica["pruned_data"].shape[0]:
-        mean_col = mean[:, None]
-        act = unmix @ (ica["pruned_data"] - mean_col)
-        act[reject_mask, :] = 0.0
-        data_clean = ica["icawinv"] @ act + mean_col
+        act = unmix @ (ica["pruned_data"] - mean[:, None])
     else:
-        act = unmix @ ica["pruned_data"]                    # (n_ic, n_samples)
-        act[reject_mask, :] = 0.0
-        data_clean = ica["icawinv"] @ act                   # (n_ch, n_samples)
-    return data_clean
+        act = unmix @ ica["pruned_data"]
+
+    rej_indices = np.where(reject_mask)[0]
+    delta = ica["icawinv"][:, rej_indices] @ act[rej_indices, :]
+    return ica["pruned_data"] - delta
 
 
 def compute_ica_metrics(data_after, data_before, sfreq,
                         n_ch_removed, n_ic_rejected, n_ic_total,
-                        n_channels_original):
+                        n_channels_original, ch_names=None):
     """
-    Alpha retention + variance drop + composite loss. Compared on the
-    channel-pruned set (before = pruned pre-IC-removal, after = post-removal),
-    which isolates the effect of the IC rejection threshold.
+    Alpha retention + variance drop + composite loss. Evaluates alpha retention
+    selectively on occipital/parietal channels to avoid penalizing frontal blink removal.
     """
     nperseg = int(min(4 * sfreq, data_after.shape[-1]))
     f_after, psd_after = welch(data_after, sfreq, nperseg=nperseg, axis=-1)
     _, psd_before = welch(data_before, sfreq, nperseg=nperseg, axis=-1)
 
     m_alpha = (f_after >= ALPHA_BAND[0]) & (f_after <= ALPHA_BAND[1])
-    p_alpha_after = float(np.mean(psd_after[:, m_alpha]))
-    p_alpha_before = float(np.mean(psd_before[:, m_alpha]))
+
+    occ_par_names = {"O1", "Oz", "O2", "POz", "Pz", "P3", "P4", "P1", "P2"}
+    occ_idx = [i for i, ch in enumerate(ch_names) if ch in occ_par_names] if ch_names else []
+    if len(occ_idx) > 0:
+        p_alpha_after = float(np.mean(psd_after[occ_idx, :][:, m_alpha]))
+        p_alpha_before = float(np.mean(psd_before[occ_idx, :][:, m_alpha]))
+    else:
+        p_alpha_after = float(np.mean(psd_after[:, m_alpha]))
+        p_alpha_before = float(np.mean(psd_before[:, m_alpha]))
+
     alpha_retention = float(np.clip(p_alpha_after / max(p_alpha_before, 1e-12), 0.0, 1.5))
 
     var_before = float(np.var(data_before))
@@ -791,13 +805,13 @@ def compute_ica_metrics(data_after, data_before, sfreq,
     variance_penalty = max(0.0, variance_drop - 0.15) ** 2
     channel_penalty = (n_ch_removed / n_channels_original) ** 2
     ic_penalty = max(0.0, 0.5 - ic_ratio) ** 2
-    ic_rej_penalty = max(0.0, ic_rej_frac - 0.40) ** 2
+    ic_rej_penalty = max(0.0, ic_rej_frac - 0.20) ** 2
 
-    loss = (100.0 * alpha_penalty +
+    loss = (300.0 * alpha_penalty +
             50.0 * variance_penalty +
             200.0 * channel_penalty +
             500.0 * ic_penalty +
-            400.0 * ic_rej_penalty)
+            500.0 * ic_rej_penalty)
 
     return {
         "loss": float(loss),
@@ -811,33 +825,200 @@ def compute_ica_metrics(data_after, data_before, sfreq,
     }
 
 
-def sweep_thresholds(ica: dict, sfreq: float, n_channels_original: int) -> list[dict]:
+def optuna_target_signal_optimization(
+    ica: dict,
+    sfreq: float,
+    n_channels_original: int,
+    ecg_data: np.ndarray | None = None,
+    n_trials: int = 60,
+) -> tuple[dict, dict, list[dict]]:
     """
-    For each threshold in THRESHOLD_GRID, decide rejected ICs from the saved
-    classifications, reconstruct, and score. Returns per-threshold metrics.
+    Optuna Bayesian optimization of multi-class artifact rejection parameters.
+    Targets physiological SNR:
+      1. Preserves occipital/parietal alpha rhythms (8-13 Hz) on O1, Oz, O2, POz, Pz, etc.
+      2. Suppresses frontal blinks and ocular artifacts on Fp1, Fp2.
+      3. Minimizes ECG cross-correlation (BCG residuals) when ECG is available.
+      4. Strictly penalizes removal of brain-labeled neural components.
+      5. Caps max rejected components to avoid over-cleaning.
     """
-    ic_classes = ica["ic_classes"]
     pruned = ica["pruned_data"]
-    n_ic = ica["n_ic"]
-    n_removed = ica["n_removed"]
-    results = []
+    n_ic = int(ica["n_ic"])
+    ic_classes = ica["ic_classes"]
+    ch_names = ica.get("ch_names", [])
 
-    for thr in THRESHOLD_GRID:
-        mask = decide_rejected_ics(ic_classes, thr)
-        n_rej = int(mask.sum())
-        data_clean = reconstruct_without_ics(ica, mask)
-        metrics = compute_ica_metrics(
-            data_clean, pruned, sfreq,
-            n_removed, n_rej, n_ic, n_channels_original
+    occ_par_names = {"O1", "Oz", "O2", "POz", "Pz", "P3", "P4", "P1", "P2"}
+    occ_idx = [i for i, ch in enumerate(ch_names) if ch in occ_par_names]
+    front_names = {"Fp1", "Fp2", "AF3", "AF4", "AFz", "Fpz"}
+    front_idx = [i for i, ch in enumerate(ch_names) if ch in front_names]
+
+    unmix = ica["icaweights"] @ ica["icasphere"]
+    mean = ica.get("pca_mean", None)
+    mean_col = mean[:, None] if (mean is not None and mean.ndim > 0 and mean.shape[0] == pruned.shape[0]) else np.zeros((pruned.shape[0], 1))
+    act_orig = unmix @ (pruned - mean_col)
+
+    # Precalculate ECG cross-correlation with each IC source if ECG is present
+    ecg_corrs = np.zeros(n_ic, dtype=float)
+    if ecg_data is not None:
+        min_len = min(act_orig.shape[1], len(ecg_data))
+        e = ecg_data[:min_len] - np.mean(ecg_data[:min_len])
+        e_std = np.std(e)
+        if e_std > 1e-12:
+            for c in range(n_ic):
+                s = act_orig[c, :min_len] - np.mean(act_orig[c, :min_len])
+                s_std = np.std(s)
+                if s_std > 1e-12:
+                    ecg_corrs[c] = abs(float(np.dot(s, e) / (min_len * s_std * e_std)))
+
+    nperseg = int(min(4 * sfreq, pruned.shape[-1]))
+    eval_occ = occ_idx if len(occ_idx) > 0 else list(range(pruned.shape[0]))
+    f, psd_before_occ = welch(pruned[eval_occ, :], sfreq, nperseg=nperseg, axis=-1)
+    m_alpha = (f >= ALPHA_BAND[0]) & (f <= ALPHA_BAND[1])
+    p_alpha_occ_before = float(np.mean(psd_before_occ[:, m_alpha]))
+    var_front_before = float(np.var(pruned[front_idx, :])) if len(front_idx) > 0 else float(np.var(pruned))
+
+    icawinv_occ = ica["icawinv"][eval_occ, :]
+    icawinv_front = ica["icawinv"][front_idx, :] if len(front_idx) > 0 else None
+    pruned_occ = pruned[eval_occ, :]
+    pruned_front = pruned[front_idx, :] if len(front_idx) > 0 else None
+
+    trial_records = []
+
+    def objective(trial: optuna.Trial) -> float:
+        thresh_eye = trial.suggest_float("thresh_eye", 0.60, 0.85, step=0.05)
+        thresh_heart = trial.suggest_float("thresh_heart", 0.55, 0.85, step=0.05)
+        thresh_muscle = trial.suggest_float("thresh_muscle", 0.75, 0.95, step=0.05)
+        thresh_line_chan = trial.suggest_float("thresh_line_chan", 0.70, 0.90, step=0.05)
+        r_ecg_thresh = trial.suggest_float("r_ecg_thresh", 0.20, 0.35, step=0.05)
+        max_brain_prob = trial.suggest_float("max_brain_prob", 0.15, 0.25, step=0.05)
+        max_rej_fraction = trial.suggest_float("max_rej_fraction", 0.08, 0.20, step=0.02)
+        iclabel_thresh = trial.suggest_float("iclabel_thresh", 0.65, 0.85, step=0.05)
+
+        candidate_rejects = []
+        for c in range(n_ic):
+            probs = ic_classes[c]
+            dom = int(np.argmax(probs))
+            p_max = float(probs[dom])
+            p_brain = float(probs[0])
+            is_rej = False
+            if dom == 2 and p_max >= thresh_eye and p_brain < max_brain_prob:
+                is_rej = True
+            elif dom == 3 and p_max >= thresh_heart and p_brain < max_brain_prob:
+                is_rej = True
+            elif ecg_corrs[c] >= r_ecg_thresh and p_brain < max_brain_prob:
+                is_rej = True
+            elif dom in (4, 5) and p_max >= thresh_line_chan and p_brain < min(max_brain_prob, 0.15):
+                is_rej = True
+            elif dom == 1 and p_max >= thresh_muscle and p_brain < min(max_brain_prob, 0.10):
+                is_rej = True
+
+            if is_rej:
+                conf = p_max - p_brain + 0.5 * ecg_corrs[c]
+                candidate_rejects.append((c, conf, p_brain, ecg_corrs[c]))
+
+        max_allowed = max(1, int(max_rej_fraction * n_ic))
+        if len(candidate_rejects) > max_allowed:
+            candidate_rejects.sort(key=lambda x: x[1], reverse=True)
+            candidate_rejects = candidate_rejects[:max_allowed]
+
+        rej_indices = [c for c, _, _, _ in candidate_rejects]
+        n_rej = len(rej_indices)
+        if n_rej == 0:
+            loss = 10.0
+            trial_records.append({
+                "loss": loss, "alpha_retention": 1.0, "variance_drop": 0.0,
+                "n_ic_rejected": 0, "n_ic_total": n_ic, "ic_rej_frac": 0.0,
+                "iclabel_thresh": iclabel_thresh, "params": trial.params
+            })
+            return loss
+
+        delta_occ = icawinv_occ[:, rej_indices] @ act_orig[rej_indices, :]
+        clean_occ = pruned_occ - delta_occ
+
+        _, psd_clean_occ = welch(clean_occ, sfreq, nperseg=nperseg, axis=-1)
+        p_alpha_occ_after = float(np.mean(psd_clean_occ[:, m_alpha]))
+        alpha_ret = float(np.clip(p_alpha_occ_after / max(p_alpha_occ_before, 1e-12), 0.0, 1.5))
+
+        front_drop = 0.0
+        if pruned_front is not None:
+            delta_front = icawinv_front[:, rej_indices] @ act_orig[rej_indices, :]
+            clean_front = pruned_front - delta_front
+            var_front_clean = float(np.var(clean_front))
+            front_drop = float(np.clip((var_front_before - var_front_clean) / max(var_front_before, 1e-12), 0.0, 1.0))
+
+        alpha_pen = max(0.0, 0.85 - alpha_ret) ** 2
+        brain_cost = sum(bp for _, _, bp, _ in candidate_rejects)
+        ecg_suppr = sum(ec for _, _, _, ec in candidate_rejects)
+        rej_frac = n_rej / n_ic
+        over_rej = max(0.0, rej_frac - 0.20) ** 2
+
+        loss = (
+            300.0 * alpha_pen +
+            150.0 * brain_cost +
+            500.0 * over_rej -
+            15.0 * front_drop -
+            20.0 * ecg_suppr
         )
-        metrics["iclabel_thresh"] = float(thr)
-        results.append(metrics)
-        print(f"  [Phase 3] ICth={thr:.2f} -> "
-              f"a_ret={metrics['alpha_retention']:.2f}, "
-              f"varDrop={metrics['variance_drop']:.2f}, "
-              f"icRej={n_rej}/{n_ic} ({metrics['ic_rej_frac']:.0%}) "
-              f"(Loss={metrics['loss']:.2f})")
-    return results
+
+        trial.set_user_attr("alpha_retention", alpha_ret)
+        trial.set_user_attr("front_drop", front_drop)
+        trial.set_user_attr("n_ic_rejected", n_rej)
+        trial.set_user_attr("rejected_ics", rej_indices)
+
+        trial_records.append({
+            "loss": float(loss),
+            "alpha_retention": float(alpha_ret),
+            "front_drop": float(front_drop),
+            "n_ic_rejected": int(n_rej),
+            "n_ic_total": int(n_ic),
+            "ic_rej_frac": float(rej_frac),
+            "rejected_ics": rej_indices,
+            "iclabel_thresh": float(iclabel_thresh),
+            "params": trial.params,
+        })
+        return float(loss)
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    sampler = optuna.samplers.TPESampler(seed=42)
+    study = optuna.create_study(direction="minimize", sampler=sampler)
+    study.optimize(objective, n_trials=n_trials)
+
+    best_trial = study.best_trial
+    best_params = dict(best_trial.params)
+    best_loss = float(best_trial.value)
+
+    # Compute variance drop on full pruned set for the winning rejection mask
+    winning_mask = np.zeros(n_ic, dtype=bool)
+    winning_rejects = best_trial.user_attrs.get("rejected_ics", [])
+    winning_mask[winning_rejects] = True
+    clean_full = reconstruct_without_ics(ica, winning_mask)
+    var_before = float(np.var(pruned))
+    var_after = float(np.var(clean_full))
+    var_drop = float(np.clip((var_before - var_after) / max(var_before, 1e-12), 0.0, 1.0))
+
+    best_metrics = {
+        "loss": best_loss,
+        "alpha_retention": float(best_trial.user_attrs.get("alpha_retention", 1.0)),
+        "variance_drop": var_drop,
+        "n_ic_rejected": int(len(winning_rejects)),
+        "n_ic_total": n_ic,
+        "ic_rej_frac": float(len(winning_rejects) / max(n_ic, 1)),
+        "rejected_ics": [int(x) for x in winning_rejects],
+    }
+
+    print(f"  [Phase 3 Optuna] {n_trials} trials complete.")
+    print(f"    Best Loss: {best_loss:.3f} | Occ Alpha Retention: {best_metrics['alpha_retention']:.2%} | VarDrop: {var_drop:.2%}")
+    print(f"    Rejected ICs: {best_metrics['n_ic_rejected']}/{n_ic} {winning_rejects}")
+    print(f"    Optimal Thresholds: eye={best_params.get('thresh_eye', 0.70):.2f}, heart={best_params.get('thresh_heart', 0.70):.2f}, "
+          f"muscle={best_params.get('thresh_muscle', 0.80):.2f}, r_ecg={best_params.get('r_ecg_thresh', 0.25):.2f}, "
+          f"max_brain_prob={best_params.get('max_brain_prob', 0.20):.2f}")
+
+    return best_params, best_metrics, trial_records
+
+
+def sweep_thresholds(ica: dict, sfreq: float, n_channels_original: int) -> list[dict]:
+    """Compatibility wrapper: delegates to optuna_target_signal_optimization."""
+    _, _, records = optuna_target_signal_optimization(ica, sfreq, n_channels_original, n_trials=30)
+    return records
 
 
 # ---------------------------------------------------------------------------
@@ -874,10 +1055,11 @@ def run_optuna_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, n_trials: int = 20, 
     raw.crop(tmin=0, tmax=t_max)
     print(f"  Cropped to first {t_max:.1f}s for optimization speed")
 
+    ecg_data = raw.get_data(picks="ECG")[0] if "ECG" in raw.ch_names else None
     eeg_ch_names = [ch for ch in raw.ch_names if ch != "ECG"]
     raw.pick(eeg_ch_names)
     data = raw.get_data()
-    ch_names = raw.ch_names
+    ch_names = list(raw.ch_names)
     n_channels_original = len(ch_names)
 
     work_dir = segment_dir / "optuna_ica_trials"
@@ -941,10 +1123,13 @@ def run_optuna_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, n_trials: int = 20, 
 
     mat_in.unlink(missing_ok=True)
 
-    # ---- Phase 3: threshold sweep (Python) ----
-    sweep = sweep_thresholds(ica, sfreq, n_channels_original)
-    best_sweep = min(sweep, key=lambda m: m["loss"])
-    best_thresh = best_sweep["iclabel_thresh"]
+    # ---- Phase 3: target signal Bayesian optimization (Optuna) ----
+    if "ch_names" not in ica or not ica["ch_names"]:
+        ica["ch_names"] = [ch for ch in ch_names if ch not in ica.get("removed_chans", [])]
+
+    best_optuna, best_metrics, trial_records = optuna_target_signal_optimization(
+        ica, sfreq, n_channels_original, ecg_data=ecg_data, n_trials=60
+    )
 
     def _export_crit(v):
         return "off" if str(v).lower() == "off" else float(v)
@@ -953,31 +1138,35 @@ def run_optuna_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, n_trials: int = 20, 
         "flatline_crit": _export_crit(best_ch["flatline_crit"]),
         "channel_crit": _export_crit(best_ch["channel_crit"]),
         "line_crit": _export_crit(best_ch["line_crit"]),
-        "iclabel_thresh": float(best_thresh),
         "burst_crit": (best_burst if best_burst == "off" else float(best_burst)),
+        "iclabel_thresh": float(best_optuna.get("iclabel_thresh", 0.70)),
+        "thresh_eye": float(best_optuna.get("thresh_eye", 0.70)),
+        "thresh_heart": float(best_optuna.get("thresh_heart", 0.70)),
+        "thresh_muscle": float(best_optuna.get("thresh_muscle", 0.80)),
+        "thresh_line_chan": float(best_optuna.get("thresh_line_chan", 0.75)),
+        "r_ecg_thresh": float(best_optuna.get("r_ecg_thresh", 0.25)),
+        "max_brain_prob": float(best_optuna.get("max_brain_prob", 0.20)),
+        "max_rej_fraction": float(best_optuna.get("max_rej_fraction", 0.20)),
     }
 
     print("\n" + "=" * 80)
-    print("TWO-PHASE ICA OPTIMIZATION COMPLETE!")
+    print("TWO-PHASE ICA TARGET-SIGNAL OPTIMIZATION COMPLETE!")
     print(f"  Best clean_rawdata: flat={best_params['flatline_crit']}, "
           f"ch={best_params['channel_crit']}, line={best_params['line_crit']}")
-    print(f"  Best iclabel_thresh = {best_thresh:.2f}  "
-          f"(a_ret={best_sweep['alpha_retention']:.2f}, "
-          f"varDrop={best_sweep['variance_drop']:.2f}, "
-          f"icRej={best_sweep['n_ic_rejected']}/{best_sweep['n_ic_total']}, "
-          f"Loss={best_sweep['loss']:.2f})")
+    print(f"  Best params: eye={best_params['thresh_eye']:.2f}, heart={best_params['thresh_heart']:.2f}, "
+          f"muscle={best_params['thresh_muscle']:.2f}, max_brain_prob={best_params['max_brain_prob']:.2f}")
+    print(f"  Occipital Alpha Retention: {best_metrics['alpha_retention']:.1%} | ICs rejected: {best_metrics['n_ic_rejected']}/{best_metrics['n_ic_total']}")
     print(f"  Best ASR BurstCriterion = {best_burst}")
     print("=" * 80)
 
     res_dict = {
         "best_params": best_params,
-        "best_value": float(best_sweep["loss"]),
+        "best_value": float(best_metrics["loss"]),
+        "best_metrics": best_metrics,
         "phase1_candidates": [
             {k: v for k, v in c.items() if not k.startswith("_")} for c in p1
         ] if p1 else [],
-        "threshold_sweep": [
-            {k: v for k, v in m.items()} for m in sweep
-        ],
+        "threshold_sweep": trial_records,
     }
     for name in ("optuna_ica_best_params.json", "ica_optuna_best.json"):
         with open(segment_dir / name, "w", encoding="utf-8") as f:
@@ -992,7 +1181,7 @@ def run_optuna_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, n_trials: int = 20, 
                 ),
             )
 
-    plot_two_phase_summary(p1, sweep, best_params, segment_dir)
+    plot_two_phase_summary(p1, trial_records, best_params, segment_dir)
     return best_params
 
 
@@ -1026,23 +1215,24 @@ def plot_two_phase_summary(p1: list[dict], sweep: list[dict],
         axes[0].grid(True, alpha=0.3)
 
     # Phase 3: loss vs threshold
-    thr = [m["iclabel_thresh"] for m in sweep]
-    loss = [m["loss"] for m in sweep]
-    rej = [m["ic_rej_frac"] * 100 for m in sweep]
-    ax2 = axes[1]
-    ax2.plot(thr, loss, "o-", color="#00b894", lw=2, ms=7, label="Loss")
-    ax2.axvline(best_params["iclabel_thresh"], color="green", lw=2, ls="--",
-                label=f"chosen={best_params['iclabel_thresh']}")
-    ax2.set_xlabel("ICLabel Threshold")
-    ax2.set_ylabel("Loss", color="#00b894")
-    ax2.set_title("Phase 3: threshold sweep")
-    ax2b = ax2.twinx()
-    ax2b.plot(thr, rej, "s--", color="#e17055", lw=1.5, ms=5, label="% ICs rejected")
-    ax2b.set_ylabel("% ICs rejected", color="#e17055")
-    ax2.grid(True, alpha=0.3)
-    lines1, labels1 = ax2.get_legend_handles_labels()
-    lines2, labels2 = ax2b.get_legend_handles_labels()
-    ax2.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="best")
+    if sweep:
+        thr = [m.get("iclabel_thresh", 0.70) for m in sweep]
+        loss = [m.get("loss", 0.0) for m in sweep]
+        rej = [m.get("ic_rej_frac", 0.0) * 100 for m in sweep]
+        ax2 = axes[1]
+        ax2.scatter(thr, loss, color="#00b894", s=40, alpha=0.7, label="Loss (Trial)")
+        ax2.axvline(best_params["iclabel_thresh"], color="green", lw=2, ls="--",
+                    label=f"chosen={best_params['iclabel_thresh']:.2f}")
+        ax2.set_xlabel("ICLabel Threshold")
+        ax2.set_ylabel("Loss", color="#00b894")
+        ax2.set_title("Phase 3: Optuna Bayesian Search")
+        ax2b = ax2.twinx()
+        ax2b.scatter(thr, rej, color="#e17055", s=30, alpha=0.6, marker="s", label="% ICs rejected")
+        ax2b.set_ylabel("% ICs rejected", color="#e17055")
+        ax2.grid(True, alpha=0.3)
+        lines1, labels1 = ax2.get_legend_handles_labels()
+        lines2, labels2 = ax2b.get_legend_handles_labels()
+        ax2.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="best")
 
     fig.tight_layout()
     out_png = segment_dir / "optuna_ica_result.png"

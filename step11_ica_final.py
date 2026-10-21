@@ -273,6 +273,13 @@ def apply_optimized_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, force: bool = F
     channel_crit = best.get("channel_crit", "off")
     line_crit = best.get("line_crit", 4.0)
     iclabel_thresh = best.get("iclabel_thresh", 0.70)
+    thresh_eye = float(best.get("thresh_eye", min(0.70, iclabel_thresh)))
+    thresh_heart = float(best.get("thresh_heart", min(0.70, iclabel_thresh)))
+    thresh_muscle = float(best.get("thresh_muscle", max(0.80, iclabel_thresh)))
+    thresh_line_chan = float(best.get("thresh_line_chan", max(0.75, iclabel_thresh)))
+    r_ecg_thresh = float(best.get("r_ecg_thresh", 0.25))
+    max_brain_prob = float(best.get("max_brain_prob", 0.20))
+    max_rej_fraction = float(best.get("max_rej_fraction", 0.20))
     ica_hp_hz = best.get("ica_hp_hz", ICA_HP_HZ)
 
     # MATLAB literal formatting: 'off' (string) or bare float
@@ -412,24 +419,24 @@ try, java.lang.System.exit(0); catch, exit(0); end
             brain_prob = float(probs[0])
             is_rej = False
 
-            if dominant == 2 and max_prob >= min(0.70, iclabel_thresh) and brain_prob < 0.20:  # Eye (blinks/saccades)
+            if dominant == 2 and max_prob >= thresh_eye and brain_prob < max_brain_prob:  # Eye (blinks/saccades)
                 is_rej = True
-            elif dominant == 3 and max_prob >= min(0.70, iclabel_thresh) and brain_prob < 0.20:  # Heart (residual BCG)
+            elif dominant == 3 and max_prob >= thresh_heart and brain_prob < max_brain_prob:  # Heart (residual BCG)
                 is_rej = True
-            elif ecg_corrs[c] >= 0.25 and brain_prob < 0.20:  # ECG-guided BCG residual
+            elif ecg_corrs[c] >= r_ecg_thresh and brain_prob < max_brain_prob:  # ECG-guided BCG residual
                 is_rej = True
                 print(f"    [ECG-GUIDED] IC {c:02d}: Residual BCG detected (r_ECG={ecg_corrs[c]:.3f}, P_brain={brain_prob:.2f})")
-            elif dominant in (4, 5) and max_prob >= max(0.75, iclabel_thresh) and brain_prob < 0.15:  # Line or Channel noise
+            elif dominant in (4, 5) and max_prob >= thresh_line_chan and brain_prob < min(max_brain_prob, 0.15):  # Line or Channel noise
                 is_rej = True
-            elif dominant == 1 and max_prob >= max(0.80, iclabel_thresh) and brain_prob < 0.10:  # High-confidence Muscle
+            elif dominant == 1 and max_prob >= thresh_muscle and brain_prob < min(max_brain_prob, 0.10):  # High-confidence Muscle
                 is_rej = True
 
             if is_rej:
                 conf_score = max_prob - brain_prob + 0.5 * ecg_corrs[c]
                 candidate_rejects.append((c, conf_score))
 
-        # Over-cleaning guard: cap rejection at 20% of components (max ~7 out of 35)
-        max_allowed = max(1, int(0.20 * n_pca))
+        # Over-cleaning guard: cap rejection at max_rej_fraction of components
+        max_allowed = max(1, int(max_rej_fraction * n_pca))
         if len(candidate_rejects) > max_allowed:
             candidate_rejects.sort(key=lambda x: x[1], reverse=True)
             print(f"    [GUARD] Capping rejected ICs from {len(candidate_rejects)} to {max_allowed} (top confidence)")
@@ -605,16 +612,29 @@ exit(0);
 
     # Compute metrics
     print("  Computing metrics...")
+    # Reference consistency: after_data is in average reference (CAR);
+    # compute baseline on average-referenced data so montage re-referencing does not distort metrics.
+    raw_before_car = raw.copy().set_eeg_reference('average', verbose=False)
+    data_before_car = raw_before_car.get_data()
+
     nperseg = int(min(4 * sfreq, after_data.shape[-1]))
     f_after, psd_after = welch(after_data, sfreq, nperseg=nperseg, axis=-1)
-    f_before, psd_before = welch(data, sfreq, nperseg=nperseg, axis=-1)
+    f_before, psd_before = welch(data_before_car, sfreq, nperseg=nperseg, axis=-1)
 
     m_alpha = (f_after >= ALPHA_BAND[0]) & (f_after <= ALPHA_BAND[1])
-    p_alpha_after = float(np.mean(psd_after[:, m_alpha]))
-    p_alpha_before = float(np.mean(psd_before[:, m_alpha]))
+
+    # Occipital/parietal channels for true physiological alpha retention
+    occ_par_names = {"O1", "Oz", "O2", "POz", "Pz", "P3", "P4", "P1", "P2"}
+    occ_idx = [i for i, ch in enumerate(ch_names) if ch in occ_par_names]
+    if len(occ_idx) > 0:
+        p_alpha_after = float(np.mean(psd_after[occ_idx, :][:, m_alpha]))
+        p_alpha_before = float(np.mean(psd_before[occ_idx, :][:, m_alpha]))
+    else:
+        p_alpha_after = float(np.mean(psd_after[:, m_alpha]))
+        p_alpha_before = float(np.mean(psd_before[:, m_alpha]))
     alpha_retention = p_alpha_after / max(p_alpha_before, 1e-12)
 
-    var_before = float(np.var(data))
+    var_before = float(np.var(data_before_car))
     var_after = float(np.var(after_data))
     variance_drop = (var_before - var_after) / max(var_before, 1e-12)
 

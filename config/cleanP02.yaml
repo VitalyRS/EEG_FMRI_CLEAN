@@ -54,7 +54,7 @@ bcg:
   # Каналы для выбора npc (фронтальные — сильный BCG, затылочные — альфа)
   pilot_channels: [Fp1, Fp2, F3, F4, Fz, Cz, C3, C4, O1, Oz, O2, Pz, P3, P4]
   # Каналы для финальных метрик и графиков
-  eval_channels: [O1, Oz, O2, Pz, P3, P4, Fz, Cz]
+  eval_channels: [Fp1, Fp2, F3, F4, Fz, Cz, C3, C4, O1, Oz, O2, Pz, P3, P4]
 
 # -----------------------------------------------------------------------------
 # step10: подбор параметров ICA-этапа
@@ -178,5 +178,8 @@ overrides:
           burst_crit: "off"
       qc:
         min_bcg_alpha_retention: 0.60
-  subjects: {}
+  subjects:
+    "1928":
+      bcg:
+        npc_grid: [2, 3]
   subject_segments: {}

@@ -69,7 +69,9 @@ DEFAULT_CONFIG = PROJECT_ROOT / "config" / "cleanP02.yaml"
 IN_SUFFIX = "_bergen_250hz"
 STEPS = ["bcg", "ica_opt", "ica_final"]
 SEGMENT_ORDER = ["ec", "eo", "drone", "lasertag", "video"]
-ICA_PARAM_KEYS = ["flatline_crit", "channel_crit", "line_crit", "iclabel_thresh", "burst_crit", "ica_hp_hz"]
+ICA_PARAM_KEYS = ["flatline_crit", "channel_crit", "line_crit", "iclabel_thresh", "burst_crit", "ica_hp_hz",
+                  "thresh_eye", "thresh_heart", "thresh_muscle", "thresh_line_chan", "r_ecg_thresh",
+                  "max_brain_prob", "max_rej_fraction"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
