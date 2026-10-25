@@ -140,6 +140,9 @@ PARAM_MAP: dict[tuple, list] = {
     ("ica_final", "guards", "max_channel_crit"): [(s11, "GUARD_MAX_CHANNEL_CRIT", _crit)],
     ("ica_final", "guards", "min_channel_crit"): [(s11, "GUARD_MAX_CHANNEL_CRIT", _crit)],
     ("ica_final", "guards", "min_burst_crit"): [(s11, "GUARD_MIN_BURST_CRIT", float)],
+    ("ica_final", "cardiac_qrs", "ratio_thresh"): [(s11, "CARDIAC_QRS_RATIO_THRESH", float)],
+    ("ica_final", "cardiac_qrs", "max_ics"): [(s11, "CARDIAC_QRS_MAX_ICS", int)],
+    ("ica_final", "cardiac_qrs", "max_brain"): [(s11, "CARDIAC_QRS_MAX_BRAIN", float)],
 }
 
 # Keys handled by this orchestrator (not injected into step modules).
@@ -591,6 +594,7 @@ class _Tee:
     def write(self, s):
         self.out.write(s)
         self.f.write(s)
+        self.f.flush()
 
     def flush(self):
         self.out.flush()

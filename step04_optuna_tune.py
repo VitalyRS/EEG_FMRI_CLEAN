@@ -217,7 +217,7 @@ def run_single_channel_matlab(segment_dir: Path, mat_1ch_path: Path, triggers_pa
         fh.write("\n".join(lines) + "\n")
 
     res = subprocess.run(
-        [str(MATLAB_BIN), "-nodesktop", "-nosplash", "-batch", f"run('{m_file.resolve()}')"],
+        [str(MATLAB_BIN), "-nodisplay", "-nodesktop", "-nosplash", "-batch", f"run('{m_file.resolve()}')"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
     )
     if not keep:

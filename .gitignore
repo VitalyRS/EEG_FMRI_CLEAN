@@ -45,6 +45,7 @@
 # =====================================================================
 EEG_files/
 data/
+data_dima/
 raw_data/
 processed_data/
 trial*/

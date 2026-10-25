@@ -10,6 +10,7 @@ PROJECT_ROOT = Path(__file__).parent.resolve()
 MATLAB_BIN = Path(os.getenv("MATLAB_BIN", "/home/vitaly/matlab2023/bin/matlab"))
 EEGLAB_DIR = Path(os.getenv("EEGLAB_DIR", "/home/vitaly/Downloads/eeglab_current/eeglab2026.0.0"))
 BERGEN_DIR = Path(os.getenv("BERGEN_DIR", str(EEGLAB_DIR / "plugins" / "BERGEN1.0")))
+BRAINBEATS_DIR = Path(os.getenv("BRAINBEATS_DIR", str(EEGLAB_DIR / "plugins" / "BrainBeats")))
 
 # External raw dataset paths
 EEG_ORIGINAL_ROOT = Path(os.getenv(

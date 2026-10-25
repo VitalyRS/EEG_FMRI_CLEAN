@@ -1,0 +1,11 @@
+addpath('/home/vitaly/Downloads/eeglab_current/eeglab2026.0.0');
+addpath('/home/vitaly/Downloads/eeglab_current/eeglab2026.0.0/plugins/clean_rawdata');
+eeglab nogui;
+S = load('/home/vitaly/PycharmProjects/Antigravity/EEG_FMRI_CLEAN/analysis_dima/_tmp/asr_test/in.mat');
+EEG = eeg_emptyset(); EEG.data = double(S.data); EEG.srate = double(S.srate); EEG.nbchan = size(S.data,1); EEG.pnts = size(S.data,2); EEG.trials = 1; EEG.xmin = 0; EEG.xmax = (EEG.pnts-1)/EEG.srate;
+for i=1:EEG.nbchan, EEG.chanlocs(i).labels = char(S.labels{i}); end;
+EEG = eeg_checkset(EEG);
+EEG = pop_chanedit(EEG, 'lookup', 'standard_1005.elc');
+EEG_c = pop_clean_rawdata(EEG, 'FlatlineCriterion', 5.0, 'ChannelCriterion', 'off', 'LineNoiseCriterion', 'off', 'Highpass', 'off', 'BurstCriterion', 25.0, 'WindowCriterion', 'off', 'BurstRejection', 'off');
+out = double(EEG_c.data); save('/home/vitaly/PycharmProjects/Antigravity/EEG_FMRI_CLEAN/analysis_dima/_tmp/asr_test/out.mat', 'out');
+exit(0);

@@ -1,0 +1,13 @@
+addpath('/home/vitaly/Downloads/eeglab_current/eeglab2026.0.0');
+addpath('/home/vitaly/Downloads/eeglab_current/eeglab2026.0.0/plugins/fMRIb2.1');
+addpath('/home/vitaly/Downloads/eeglab_current/eeglab2026.0.0/plugins/BrainBeats/functions');
+eeglab nogui;
+S = load('/home/vitaly/PycharmProjects/Antigravity/EEG_FMRI_CLEAN/analysis_dima/_tmp/test_1927_qrs/in.mat');
+EEG = eeg_emptyset(); EEG.data = double(S.data); EEG.srate = double(S.srate); EEG.nbchan = size(S.data,1); EEG.pnts = size(S.data,2); EEG.trials = 1; EEG.xmin = 0; EEG.xmax = (EEG.pnts-1)/EEG.srate;
+for i=1:EEG.nbchan, EEG.chanlocs(i).labels = char(S.labels{i}); end;
+EEG = eeg_checkset(EEG);
+ecgchan = 32;
+EEG_fmrib = pop_fmrib_qrsdetect(EEG, ecgchan, 'qrs', 'no');
+fmrib_peaks = []; for i=1:length(EEG_fmrib.event), if strcmp(EEG_fmrib.event(i).type, 'qrs'), fmrib_peaks(end+1) = EEG_fmrib.event(i).latency; end; end;
+fprintf('fmrib QRS count: %d\n', numel(fmrib_peaks));
+exit(0);

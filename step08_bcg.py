@@ -43,11 +43,13 @@ import mne
 try:
     from .config import (PROJECT_ROOT, DATA_ROOT, DEFAULT_EXPERIMENT, MATLAB_BIN,
                          EEGLAB_DIR, DEFAULT_SEGMENT_DIR, ALPHA_BAND, EVAL_CHANNELS,
-                         TARGET_SFREQ, FILTER_HP, FILTER_LP, BCG_ALPHA_GATE_MIN)
+                         TARGET_SFREQ, FILTER_HP, FILTER_LP, BCG_ALPHA_GATE_MIN,
+                         BRAINBEATS_DIR)
 except ImportError:
     from config import (PROJECT_ROOT, DATA_ROOT, DEFAULT_EXPERIMENT, MATLAB_BIN,
                         EEGLAB_DIR, DEFAULT_SEGMENT_DIR, ALPHA_BAND, EVAL_CHANNELS,
-                        TARGET_SFREQ, FILTER_HP, FILTER_LP, BCG_ALPHA_GATE_MIN)
+                        TARGET_SFREQ, FILTER_HP, FILTER_LP, BCG_ALPHA_GATE_MIN,
+                        BRAINBEATS_DIR)
 
 ECG_CH       = "ECG"          # name of cardiac channel in the .set
 CARDIAC_BAND = (0.7, 4.0)     # Hz - fundamental + harmonics of BCG
@@ -157,9 +159,14 @@ def run_fmrib_bcg_matlab(data_all: np.ndarray, ch_names: list[str], ecg_idx: int
 
     out_pattern = str(work_dir / "bcg_npc")   # -> bcg_npc%d.mat
 
+    bb_funcs = BRAINBEATS_DIR / "functions"
     base_ml = [
         f"addpath('{EEGLAB_DIR.resolve()}');",
         f"addpath('{FMRIB_DIR.resolve()}');",
+    ]
+    if bb_funcs.exists():
+        base_ml.append(f"addpath('{bb_funcs.resolve()}');")
+    base_ml += [
         "eeglab nogui;",
         f"S = load('{in_mat.resolve()}');",
         "EEG = eeg_emptyset();",
@@ -185,34 +192,104 @@ def run_fmrib_bcg_matlab(data_all: np.ndarray, ch_names: list[str], ecg_idx: int
     m_qrs = work_dir / "run_qrs.m"
     lines_qrs = base_ml + [
         f"ecgchan = {ecg_idx + 1};",
-        "fprintf('Detecting QRS on channel %d...\\n', ecgchan);",
-        "EEG = pop_fmrib_qrsdetect(EEG, ecgchan, 'qrs', 'no');",
-        "qrs_lat = [];",
-        "for i = 1:length(EEG.event)",
-        "  if strcmp(EEG.event(i).type, 'qrs')",
-        "    qrs_lat(end+1) = EEG.event(i).latency;",
+        "if exist('get_RR', 'file') == 2",
+        "  fprintf('Detecting QRS via BrainBeats (Pan-Tompkins on ECG)...\\n');",
+        "  ecg_sig = double(EEG.data(ecgchan, :));",
+        "  times_ms = (0:(EEG.pnts-1)) * (1000.0 / EEG.srate);",
+        "  % Outlier clipping of residual fMRI gradient spikes on ECG",
+        "  med_v = median(ecg_sig);",
+        "  mad_v = median(abs(ecg_sig - med_v));",
+        "  if mad_v > 0",
+        "    clip_lim = 10 * mad_v;",
+        "    ecg_clean = max(min(ecg_sig, med_v + clip_lim), med_v - clip_lim);",
+        "  else",
+        "    ecg_clean = ecg_sig;",
+        "  end",
+        "  % Adaptive Pan-Tompkins tuning to reach physiological resting HR (45-125 bpm)",
+        "  best_peaks = [];",
+        "  best_diff_hr = 999;",
+        "  target_hr = 72.0;",
+        "  for pthresh = [0.16, 0.20, 0.24, 0.30, 0.35]",
+        "    bb_params.fs = EEG.srate;",
+        "    bb_params.heart_signal = 'ecg';",
+        "    bb_params.ecg_bandpass = [4 25];",
+        "    bb_params.ecg_peakthresh = pthresh;",
+        "    bb_params.ecg_searchback = true;",
+        "    bb_params.ecg_refperiod = 0.40; % 400ms prevents T-wave false positives",
+        "    try",
+        "      [RR, ~, peaks] = get_RR(ecg_clean, times_ms, bb_params);",
+        "      if ~isempty(RR)",
+        "        med_hr = 60.0 / median(RR);",
+        "        if abs(med_hr - target_hr) < best_diff_hr && med_hr >= 45 && med_hr <= 135",
+        "          best_diff_hr = abs(med_hr - target_hr);",
+        "          best_peaks = peaks;",
+        "        end",
+        "      end",
+        "    catch",
+        "    end",
+        "  end",
+        "  if isempty(best_peaks) || numel(best_peaks) < 100",
+        "    fprintf('BrainBeats found only %d peaks; falling back to pop_fmrib_qrsdetect...\\n', numel(best_peaks));",
+        "    EEG_fm = pop_fmrib_qrsdetect(EEG, ecgchan, 'qrs', 'no');",
+        "    fm_peaks = [];",
+        "    for i = 1:length(EEG_fm.event)",
+        "      if strcmp(EEG_fm.event(i).type, 'qrs')",
+        "        fm_peaks(end+1) = EEG_fm.event(i).latency;",
+        "      end",
+        "    end",
+        "    if numel(fm_peaks) > numel(best_peaks)",
+        "      best_peaks = fm_peaks;",
+        "    end",
+        "  end",
+        "  qrs_lat = double(best_peaks(:));",
+        "else",
+        "  fprintf('Detecting QRS via pop_fmrib_qrsdetect on channel %d...\\n', ecgchan);",
+        "  EEG = pop_fmrib_qrsdetect(EEG, ecgchan, 'qrs', 'no');",
+        "  qrs_lat = [];",
+        "  for i = 1:length(EEG.event)",
+        "    if strcmp(EEG.event(i).type, 'qrs')",
+        "      qrs_lat(end+1) = EEG.event(i).latency;",
+        "    end",
         "  end",
         "end",
         f"save('{qrs_mat.resolve()}', 'qrs_lat', '-v7');",
-        "fprintf('QRS events: %d\\n', numel(qrs_lat));",
+        "fprintf('Raw QRS events: %d\\n', numel(qrs_lat));",
         "exit(0);"
     ]
     m_qrs.write_text("\n".join(lines_qrs) + "\n", encoding="ascii")
     
-    print(f"  Launching MATLAB fMRIB (QRS detection)...")
-    res = subprocess.run(
-        [str(MATLAB_BIN), "-nodesktop", "-nosplash", "-batch", f"run('{m_qrs.resolve()}')"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-    )
-    if res.returncode != 0:
-        tail = "\n".join(res.stdout.splitlines()[-30:])
-        raise RuntimeError(f"MATLAB fMRIB QRS failed (code {res.returncode}):\n{tail}")
-    if not qrs_mat.exists():
-        raise RuntimeError("MATLAB did not produce QRS output.")
+    print(f"  Launching MATLAB QRS detection (BrainBeats / fMRIB)...")
+    res = None
+    try:
+        res = subprocess.run(
+            [str(MATLAB_BIN), "-nodisplay", "-nodesktop", "-nosplash", "-batch", f"run('{m_qrs.resolve()}')"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=240
+        )
+    except subprocess.TimeoutExpired as tex:
+        print(f"    [WARN] MATLAB QRS timed out after 240s; checking if output was written...")
+        res = None
+
+    if not qrs_mat.exists() or qrs_mat.stat().st_size < 100:
+        tail = "\n".join((res.stdout if res else "").splitlines()[-30:])
+        raise RuntimeError(f"MATLAB QRS detection failed to produce valid output (code {res.returncode if res else 'timeout'}):\n{tail}")
         
     qrs = np.array(sio.loadmat(qrs_mat)["qrs_lat"], dtype=float).flatten()
     qrs = np.round(qrs).astype(int) - 1        # 1-based -> 0-based
     qrs = qrs[(qrs >= 0) & (qrs < data_all.shape[1])]
+
+    # Physiological deduplication and refractory check (min RR = 0.38s -> max HR = ~158 bpm)
+    qrs = np.sort(np.unique(qrs))
+    if len(qrs) > 1:
+        min_dist = int(0.38 * sfreq)
+        cleaned_qrs = [qrs[0]]
+        for p in qrs[1:]:
+            if p - cleaned_qrs[-1] >= min_dist:
+                cleaned_qrs.append(p)
+        qrs = np.array(cleaned_qrs, dtype=int)
+    # Re-save 1-based sanitized QRS coordinates for all OBS sessions
+    sio.savemat(qrs_mat, {"qrs_lat": (qrs + 1).reshape(-1, 1)})
+    med_rr = float(np.median(np.diff(qrs)) / sfreq) if len(qrs) > 1 else 1.0
+    print(f"  Valid QRS peaks: {len(qrs)} (median RR: {med_rr:.3f} s, ~{60.0/med_rr:.1f} bpm)")
 
     # --- Step 2: Loop over npc in separate MATLAB sessions ---
     cleaned_paths = {}
@@ -234,17 +311,22 @@ def run_fmrib_bcg_matlab(data_all: np.ndarray, ch_names: list[str], ecg_idx: int
         ]
         m_obs.write_text("\n".join(lines_obs) + "\n", encoding="ascii")
         print(f"    Launching MATLAB fMRIB OBS (npc={npc})...")
-        res = subprocess.run(
-            [str(MATLAB_BIN), "-nodesktop", "-nosplash", "-batch", f"run('{m_obs.resolve()}')"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-        )
-        if res.returncode != 0:
-            tail = "\n".join(res.stdout.splitlines()[-30:])
-            print(f"      [WARN] MATLAB fMRIB OBS failed for npc={npc}:\n{tail}")
+        res_obs = None
+        try:
+            res_obs = subprocess.run(
+                [str(MATLAB_BIN), "-nodisplay", "-nodesktop", "-nosplash", "-batch", f"run('{m_obs.resolve()}')"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300
+            )
+        except subprocess.TimeoutExpired:
+            print(f"      [WARN] MATLAB fMRIB OBS timed out after 300s for npc={npc}")
+            res_obs = None
+
+        p = Path(fname)
+        if p.exists() and p.stat().st_size > 1000:
+            cleaned_paths[npc] = p
         else:
-            p = Path(fname)
-            if p.exists():
-                cleaned_paths[npc] = p
+            tail = "\n".join((res_obs.stdout if res_obs else "").splitlines()[-30:])
+            print(f"      [WARN] MATLAB fMRIB OBS failed for npc={npc}:\n{tail}")
         m_obs.unlink(missing_ok=True)
 
     in_mat.unlink(missing_ok=True)
@@ -499,13 +581,12 @@ def run_bcg_pipeline(segment_dir: Path = DEFAULT_SEGMENT_DIR, npc_grid=None, for
     subject_id = segment_dir.parent.parent.name if segment_dir.parent.name == "segments" else segment_dir.parent.name
     bergen_fif = DATA_ROOT / subject_id / "derivatives" / "01_bergen_250hz" / seg_name / f"{seg_name}_bergen_250hz_eeg.fif"
 
-    if resamp_fif.exists():
+    # NOTE: resamp_fif is already band-passed. With force=True we must rebuild it
+    # from the unfiltered Bergen source, NOT re-filter the stored file (that would
+    # stack another HP/LP pass on every forced re-run and erode low-freq/alpha power).
+    if resamp_fif.exists() and not force:
         print(f"  Found pre-existing resampled 250 Hz data: {resamp_fif.name}, loading directly...")
         raw_rs = mne.io.read_raw_fif(resamp_fif, preload=True, verbose=False)
-        if force:
-            print(f"  Re-applying band-pass filter ({FILTER_HP}-{FILTER_LP} Hz)...")
-            raw_rs = bandpass_raw(raw_rs, FILTER_HP, FILTER_LP)
-            raw_rs.save(resamp_fif, overwrite=True, verbose=False)
     elif bergen_fif.exists():
         print(f"  Found 250 Hz Bergen data: {bergen_fif.name}, loading...")
         raw_rs = mne.io.read_raw_fif(bergen_fif, preload=True, verbose=False)
@@ -552,6 +633,7 @@ def run_bcg_pipeline(segment_dir: Path = DEFAULT_SEGMENT_DIR, npc_grid=None, for
           f"(median HR ~ {60.0/np.median(np.diff(r_peaks)/sfreq):.0f} bpm)"
           if len(r_peaks) > 1 else f"  QRS peaks: {len(r_peaks)}")
     plot_rpeaks(ecg, r_peaks, sfreq, qc_dir / f"{seg_name}_rpeaks.png")
+    np.save(bcg_dir / f"{seg_name}_qrs.npy", np.asarray(r_peaks, dtype=np.int64))
 
     if not cleaned_paths:
         raise RuntimeError("fMRIB produced no cleaned output for any npc.")

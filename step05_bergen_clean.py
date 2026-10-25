@@ -192,7 +192,7 @@ exit(0);
         f.write(code)
 
     res = subprocess.run(
-        [str(MATLAB_BIN), "-nodesktop", "-nosplash", "-batch", f"run('{m_script.resolve()}')"],
+        [str(MATLAB_BIN), "-nodisplay", "-nodesktop", "-nosplash", "-batch", f"run('{m_script.resolve()}')"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
     )
     m_script.unlink(missing_ok=True)

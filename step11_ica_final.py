@@ -45,6 +45,12 @@ GUARD_MAX_CHANNEL_CRIT = 0.70     # -> clamped to 0.70 if higher (higher Channel
 GUARD_MIN_BURST_CRIT = 5.0        # -> clamped to 20.0 if lower (lower = more aggressive reconstruction)
 # ICLabel backend: "python" (mne-icalabel, recommended) or "matlab"
 ICLABEL_BACKEND = "python"
+# QRS-locked residual-BCG detector: an IC whose energy is largely explained by the
+# QRS-locked average (evoked-energy ratio) is residual ballistocardiogram. Linear
+# ECG correlation / ICLabel 'heart' miss these (r<=0.3). 0 disables the rule.
+CARDIAC_QRS_RATIO_THRESH = 0.05   # noise level is ~0.002; true BCG ICs were 0.08-0.64
+CARDIAC_QRS_MAX_ICS = 4           # never remove more than this many ICs by this rule
+CARDIAC_QRS_MAX_BRAIN = 0.80      # keep an IC if ICLabel is very sure it is brain
 
 
 def _pca_cap_ml() -> str:
@@ -395,19 +401,65 @@ try, java.lang.System.exit(0); catch, exit(0); end
         print("  [Part 3] Running ICLabel classification (mne-icalabel)...")
         ic_classes = iclabel_label_components(raw_for_ica, ica)
 
-        # Check cross-correlation with ECG to reliably detect residual BCG components
+        # QRS-locked evoked-energy ratio per IC (needs <seg>_qrs.npy saved by step08 or bcg_qrs.mat)
+        qrs_ratio = np.zeros(n_pca)
+        cardiac_ics: set[int] = set()
+        qrs_idx = None
+        qrs_file = fif.with_name(fif.name.replace("_bcg_clean.fif", "_qrs.npy"))
+        qrs_mat_file = fif.parent / "_matlab_tmp" / "bcg_qrs.mat"
+        if qrs_file.exists():
+            qrs_idx = np.load(qrs_file).astype(int)
+        elif qrs_mat_file.exists():
+            import scipy.io as sio
+            mat_q = sio.loadmat(qrs_mat_file)
+            if "qrs_lat" in mat_q:
+                qrs_idx = (np.atleast_1d(mat_q["qrs_lat"]).flatten() - 1).astype(int)
+                try:
+                    np.save(qrs_file, qrs_idx)
+                except Exception:
+                    pass
+
+        if CARDIAC_QRS_RATIO_THRESH and qrs_idx is not None:
+            src_q = ica.get_sources(raw_for_ica).get_data()
+            qa, qb = int(-0.2 * sfreq), int(0.8 * sfreq)
+            ok_idx = [i for i in qrs_idx if i + qa >= 0 and i + qb < src_q.shape[1]]
+            if len(ok_idx) >= 50:
+                for c in range(n_pca):
+                    ep = np.stack([src_q[c, i + qa:i + qb] for i in ok_idx])
+                    ep = ep - ep.mean(axis=1, keepdims=True)
+                    qrs_ratio[c] = float(np.mean(ep.mean(axis=0) ** 2) / (np.mean(ep ** 2) + 1e-30))
+                ranked = [int(c) for c in np.argsort(qrs_ratio)[::-1][:CARDIAC_QRS_MAX_ICS]
+                          if qrs_ratio[c] >= CARDIAC_QRS_RATIO_THRESH]
+                cardiac_ics = {c for c in ranked if (qrs_ratio[c] >= 0.10 or float(ic_classes[c][0]) < CARDIAC_QRS_MAX_BRAIN)}
+                print(f"    [QRS-LOCKED] {len(ok_idx)} beats; evoked-energy ratio top: "
+                      f"{[(int(c), round(float(qrs_ratio[c]), 3)) for c in np.argsort(qrs_ratio)[::-1][:5]]} "
+                      f"-> cardiac ICs {sorted(cardiac_ics)}")
+            else:
+                print(f"    [QRS-LOCKED] only {len(ok_idx)} usable beats; rule skipped")
+        elif CARDIAC_QRS_RATIO_THRESH:
+            print(f"    [QRS-LOCKED] neither {qrs_file.name} nor {qrs_mat_file.name} found; rule skipped")
+
+        # Check cross-correlation with ECG over physiological lag window (0..350 ms)
+        # to reliably detect residual BCG components (pulse delay to head is ~150-250 ms)
         ecg_corrs = np.zeros(n_pca)
+        ecg_best_lags = np.zeros(n_pca)
         if ecg_data is not None:
             sources = ica.get_sources(raw_clean).get_data()
             min_len = min(sources.shape[1], len(ecg_data))
             e = ecg_data[:min_len] - np.mean(ecg_data[:min_len])
             e_std = np.std(e)
-            if e_std > 1e-12:
+            max_lag = int(0.35 * sfreq)  # 350 ms physiological window
+            if e_std > 1e-12 and min_len > max_lag:
                 for c in range(n_pca):
                     s = sources[c, :min_len] - np.mean(sources[c, :min_len])
                     s_std = np.std(s)
                     if s_std > 1e-12:
-                        ecg_corrs[c] = abs(float(np.dot(s, e) / (min_len * s_std * e_std)))
+                        lags_r = [abs(float(np.dot(s[lag:], e[:min_len - lag]) / ((min_len - lag) * s_std * e_std)))
+                                  for lag in range(0, max_lag + 1, 2)]
+                        if lags_r:
+                            best_idx = int(np.argmax(lags_r))
+                            ecg_corrs[c] = float(lags_r[best_idx])
+                            ecg_best_lags[c] = (best_idx * 2) / sfreq * 1000.0
 
         # Balanced rejection rule for EEG-fMRI:
         # Classes: 0: Brain, 1: Muscle, 2: Eye, 3: Heart, 4: Line, 5: Chan, 6: Other
@@ -421,22 +473,25 @@ try, java.lang.System.exit(0); catch, exit(0); end
 
             if dominant == 2 and max_prob >= thresh_eye and brain_prob < max_brain_prob:  # Eye (blinks/saccades)
                 is_rej = True
-            elif dominant == 3 and max_prob >= thresh_heart and brain_prob < max_brain_prob:  # Heart (residual BCG)
+            elif (dominant == 3 or probs[3] >= thresh_heart) and brain_prob < max_brain_prob:  # Heart (residual BCG)
                 is_rej = True
             elif ecg_corrs[c] >= r_ecg_thresh and brain_prob < max_brain_prob:  # ECG-guided BCG residual
                 is_rej = True
-                print(f"    [ECG-GUIDED] IC {c:02d}: Residual BCG detected (r_ECG={ecg_corrs[c]:.3f}, P_brain={brain_prob:.2f})")
+                print(f"    [ECG-GUIDED] IC {c:02d}: Residual BCG detected (lagged r_ECG={ecg_corrs[c]:.3f} at lag={ecg_best_lags[c]:.0f}ms, P_brain={brain_prob:.2f})")
+            elif c in cardiac_ics:  # QRS-locked residual BCG
+                is_rej = True
+                print(f"    [QRS-LOCKED] IC {c:02d}: Residual BCG (evoked-energy ratio={qrs_ratio[c]:.3f}, P_brain={brain_prob:.2f})")
             elif dominant in (4, 5) and max_prob >= thresh_line_chan and brain_prob < min(max_brain_prob, 0.15):  # Line or Channel noise
                 is_rej = True
             elif dominant == 1 and max_prob >= thresh_muscle and brain_prob < min(max_brain_prob, 0.10):  # High-confidence Muscle
                 is_rej = True
 
             if is_rej:
-                conf_score = max_prob - brain_prob + 0.5 * ecg_corrs[c]
+                conf_score = max_prob - brain_prob + 0.5 * ecg_corrs[c] + (1.0 + qrs_ratio[c] if c in cardiac_ics else 0.0)
                 candidate_rejects.append((c, conf_score))
 
-        # Over-cleaning guard: cap rejection at max_rej_fraction of components
-        max_allowed = max(1, int(max_rej_fraction * n_pca))
+        # Over-cleaning guard: cap rejection at max_rej_fraction of components (at least 5 to allow eye + ECG residuals)
+        max_allowed = max(5, int(max_rej_fraction * n_pca))
         if len(candidate_rejects) > max_allowed:
             candidate_rejects.sort(key=lambda x: x[1], reverse=True)
             print(f"    [GUARD] Capping rejected ICs from {len(candidate_rejects)} to {max_allowed} (top confidence)")

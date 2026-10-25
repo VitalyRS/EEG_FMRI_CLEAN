@@ -857,17 +857,21 @@ def optuna_target_signal_optimization(
     act_orig = unmix @ (pruned - mean_col)
 
     # Precalculate ECG cross-correlation with each IC source if ECG is present
+    # Using physiological lag window (0..350 ms) to capture BCG delay from heart to head
     ecg_corrs = np.zeros(n_ic, dtype=float)
     if ecg_data is not None:
         min_len = min(act_orig.shape[1], len(ecg_data))
         e = ecg_data[:min_len] - np.mean(ecg_data[:min_len])
         e_std = np.std(e)
-        if e_std > 1e-12:
+        max_lag = int(0.35 * sfreq)
+        if e_std > 1e-12 and min_len > max_lag:
             for c in range(n_ic):
                 s = act_orig[c, :min_len] - np.mean(act_orig[c, :min_len])
                 s_std = np.std(s)
                 if s_std > 1e-12:
-                    ecg_corrs[c] = abs(float(np.dot(s, e) / (min_len * s_std * e_std)))
+                    lags_r = [abs(float(np.dot(s[lag:], e[:min_len - lag]) / ((min_len - lag) * s_std * e_std)))
+                              for lag in range(0, max_lag + 1, 2)]
+                    ecg_corrs[c] = float(max(lags_r)) if lags_r else 0.0
 
     nperseg = int(min(4 * sfreq, pruned.shape[-1]))
     eval_occ = occ_idx if len(occ_idx) > 0 else list(range(pruned.shape[0]))
@@ -890,7 +894,7 @@ def optuna_target_signal_optimization(
         thresh_line_chan = trial.suggest_float("thresh_line_chan", 0.70, 0.90, step=0.05)
         r_ecg_thresh = trial.suggest_float("r_ecg_thresh", 0.20, 0.35, step=0.05)
         max_brain_prob = trial.suggest_float("max_brain_prob", 0.15, 0.25, step=0.05)
-        max_rej_fraction = trial.suggest_float("max_rej_fraction", 0.08, 0.20, step=0.02)
+        max_rej_fraction = trial.suggest_float("max_rej_fraction", 0.15, 0.30, step=0.05)
         iclabel_thresh = trial.suggest_float("iclabel_thresh", 0.65, 0.85, step=0.05)
 
         candidate_rejects = []
@@ -902,7 +906,7 @@ def optuna_target_signal_optimization(
             is_rej = False
             if dom == 2 and p_max >= thresh_eye and p_brain < max_brain_prob:
                 is_rej = True
-            elif dom == 3 and p_max >= thresh_heart and p_brain < max_brain_prob:
+            elif (dom == 3 or probs[3] >= thresh_heart) and p_brain < max_brain_prob:
                 is_rej = True
             elif ecg_corrs[c] >= r_ecg_thresh and p_brain < max_brain_prob:
                 is_rej = True
@@ -915,7 +919,7 @@ def optuna_target_signal_optimization(
                 conf = p_max - p_brain + 0.5 * ecg_corrs[c]
                 candidate_rejects.append((c, conf, p_brain, ecg_corrs[c]))
 
-        max_allowed = max(1, int(max_rej_fraction * n_ic))
+        max_allowed = max(5, int(max_rej_fraction * n_ic))
         if len(candidate_rejects) > max_allowed:
             candidate_rejects.sort(key=lambda x: x[1], reverse=True)
             candidate_rejects = candidate_rejects[:max_allowed]
