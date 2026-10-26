@@ -288,18 +288,111 @@ def run_fmrib_bcg_matlab(data_all: np.ndarray, ch_names: list[str], ecg_idx: int
     qrs = qrs[(qrs >= 0) & (qrs < data_all.shape[1])]
 
     # Physiological deduplication and refractory check (min RR = 0.38s -> max HR = ~158 bpm)
+    min_dist = int(0.38 * sfreq)
     qrs = np.sort(np.unique(qrs))
     if len(qrs) > 1:
-        min_dist = int(0.38 * sfreq)
         cleaned_qrs = [qrs[0]]
         for p in qrs[1:]:
             if p - cleaned_qrs[-1] >= min_dist:
                 cleaned_qrs.append(p)
         qrs = np.array(cleaned_qrs, dtype=int)
+
+    # QRS sanitation for a sharp OBS template. Pan-Tompkins returns beat markers
+    # that are slightly jittered off the R-peak (~25 ms std) and occasionally
+    # drops a beat entirely. Both blur the fMRIB Optimal-Basis-Set template, so
+    # the BCG artefact is only partially subtracted (the main gap vs. the
+    # reference cleaning). We (1) snap every marker onto the true R-peak and
+    # (2) reinsert beats that were dropped in long RR gaps.
+    if len(qrs) > 3:
+        # Clip residual gradient spikes on the ECG (same 10*MAD rule as the detector)
+        ecg_sig = data_all[ecg_idx].astype(float)
+        med_v = np.median(ecg_sig)
+        mad_v = np.median(np.abs(ecg_sig - med_v))
+        if mad_v > 0:
+            ecg_sig = np.clip(ecg_sig, med_v - 10 * mad_v, med_v + 10 * mad_v)
+        ecg_sig = ecg_sig - med_v
+        # Auto-detect R-peak polarity from the sign of the ECG at the current markers
+        pol = 1.0 if np.median(ecg_sig[qrs]) >= 0 else -1.0
+        rwave = pol * ecg_sig
+
+        # (1) Snap each marker to the local R-peak maximum (+-50 ms window)
+        snap_w = int(0.05 * sfreq)
+        snapped = []
+        for p in qrs:
+            lo, hi = max(0, p - snap_w), min(rwave.shape[0], p + snap_w + 1)
+            snapped.append(lo + int(np.argmax(rwave[lo:hi])))
+        qrs = np.array(sorted(set(snapped)), dtype=int)
+
+        # (2) Reinsert missed beats in RR gaps that span ~2x/3x the median RR
+        med_rr_smp = float(np.median(np.diff(qrs)))
+        filled = [int(qrs[0])]
+        n_inserted = 0
+        for a, b in zip(qrs[:-1], qrs[1:]):
+            gap = b - a
+            k = int(round(gap / med_rr_smp)) if med_rr_smp > 0 else 1
+            if k >= 2:
+                for j in range(1, k):
+                    cand = int(round(a + gap * j / k))
+                    lo, hi = max(0, cand - snap_w), min(rwave.shape[0], cand + snap_w + 1)
+                    if hi > lo:
+                        cand = lo + int(np.argmax(rwave[lo:hi]))
+                    if cand - filled[-1] >= min_dist:
+                        filled.append(cand)
+                        n_inserted += 1
+            filled.append(int(b))
+        qrs = np.array(sorted(set(filled)), dtype=int)
+
+        # Final refractory pass (snapping/insertion may have produced <0.38 s pairs)
+        cleaned = [qrs[0]]
+        for p in qrs[1:]:
+            if p - cleaned[-1] >= min_dist:
+                cleaned.append(p)
+        qrs = np.array(cleaned, dtype=int)
+        print(f"  QRS sanitation: snapped to R-peak (polarity {'+' if pol > 0 else '-'}), "
+              f"interpolated {n_inserted} missed beat(s)")
+
     # Re-save 1-based sanitized QRS coordinates for all OBS sessions
     sio.savemat(qrs_mat, {"qrs_lat": (qrs + 1).reshape(-1, 1)})
     med_rr = float(np.median(np.diff(qrs)) / sfreq) if len(qrs) > 1 else 1.0
     print(f"  Valid QRS peaks: {len(qrs)} (median RR: {med_rr:.3f} s, ~{60.0/med_rr:.1f} bpm)")
+
+    # QRS self-check (no reference needed): flags suspect detections per segment so
+    # the snap/interpolation can be trusted on new subjects without eyeballing.
+    #   * rr_cv        - RR coefficient of variation; a healthy resting rhythm is
+    #                    regular (<~0.15). High CV = jittered / spurious markers.
+    #   * on_rpeak     - fraction of markers sitting on the local ECG R-peak after
+    #                    snapping (good runs reach ~0.85+).
+    #   * template     - OBS template sharpness (mean evoked peak / mean |ECG|);
+    #                    higher = the BCG waveform averages coherently.
+    qrs_qc = {"n_peaks": int(len(qrs)), "median_hr_bpm": round(60.0 / med_rr, 1)}
+    if len(qrs) > 3:
+        rr = np.diff(qrs) / sfreq
+        rr_cv = float(np.std(rr) / (np.mean(rr) + 1e-12))
+        snap_w = int(0.05 * sfreq)
+        on_rpeak = float(np.mean([
+            (np.argmax(rwave[max(0, p - snap_w):p + snap_w + 1]) + max(0, p - snap_w)) == p
+            for p in qrs]))
+        a, b = int(-0.06 * sfreq), int(0.06 * sfreq)
+        ep = np.stack([rwave[p + a:p + b] for p in qrs if p + a >= 0 and p + b < rwave.shape[0]])
+        template = float(ep.mean(0).max() / (np.abs(ep).mean() + 1e-12)) if len(ep) else 0.0
+        flags = []
+        if rr_cv > 0.20:
+            flags.append(f"irregular RR (cv={rr_cv:.2f}; arrhythmia or spurious beats?)")
+        if on_rpeak < 0.70:
+            flags.append(f"only {on_rpeak*100:.0f}% of markers on R-peak (detector off / wrong polarity?)")
+        if template < 1.0:
+            flags.append(f"weak OBS template (sharpness={template:.2f})")
+        qrs_qc.update(rr_cv=round(rr_cv, 3), on_rpeak=round(on_rpeak, 3),
+                      template_sharpness=round(template, 3),
+                      flag="REVIEW" if flags else "OK")
+        print(f"  QRS QC: rr_cv={rr_cv:.3f}  on_rpeak={on_rpeak*100:.0f}%  "
+              f"template={template:.2f}  -> {qrs_qc['flag']}")
+        for fl in flags:
+            print(f"    [QRS REVIEW] {fl}")
+    try:
+        (qrs_mat.parent / "qrs_qc.json").write_text(json.dumps(qrs_qc, indent=2))
+    except Exception:
+        pass
 
     # --- Step 2: Loop over npc in separate MATLAB sessions ---
     cleaned_paths = {}

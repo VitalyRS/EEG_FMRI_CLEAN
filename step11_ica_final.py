@@ -515,7 +515,11 @@ try, java.lang.System.exit(0); catch, exit(0); end
                         prob_artifact = 1.0 / (1.0 + np.exp(-z))
 
                         is_rej = False
-                        if prob_artifact >= mm_thresh and brain_prob < max_brain_prob:
+                        # The meta-model already encodes P(brain) with a strong negative
+                        # weight (w_brain=-1.38), so its decision is self-protecting. We
+                        # only add a loose safety net: never cut an IC that ICLabel thinks
+                        # is more likely brain than anything else (brain_prob < 0.5).
+                        if prob_artifact >= mm_thresh and brain_prob < 0.5:
                             is_rej = True
                         elif ecg_corrs[c] >= r_ecg_thresh and brain_prob < max_brain_prob:
                             is_rej = True
