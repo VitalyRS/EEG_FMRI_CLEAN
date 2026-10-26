@@ -53,6 +53,7 @@ except ImportError:
 
 ECG_CH       = "ECG"          # name of cardiac channel in the .set
 CARDIAC_BAND = (0.7, 4.0)     # Hz - fundamental + harmonics of BCG
+FILTER_NOTCH = 50.0           # Hz - Notch filter for 50 Hz powerline interference
 NPC_GRID     = [1, 2, 3, 4, 5, 6, 7, 8]   # OBS basis components to sweep (incl. gentle 1-2)
 FMRIB_DIR    = EEGLAB_DIR / "plugins" / "fMRIb2.1"
 
@@ -119,18 +120,27 @@ def resample_raw(raw: mne.io.BaseRaw, target_sfreq: float = TARGET_SFREQ) -> mne
 
 
 def bandpass_raw(raw: mne.io.BaseRaw, hp: float = FILTER_HP,
-                 lp: float = FILTER_LP) -> mne.io.BaseRaw:
+                 lp: float = FILTER_LP, notch: float | None = None) -> mne.io.BaseRaw:
     """
     Band-pass EEG channels only (the ECG channel is left untouched so fMRIB
     QRS detection still sees the raw cardiac waveform). FIR, zero-phase.
     lp is clamped just under Nyquist as a safety guard.
+    Applies Notch filter (default 50 Hz, 49-51 Hz) to EEG channels if notch < Nyquist.
     """
+    if notch is None:
+        notch = FILTER_NOTCH
     nyq = raw.info["sfreq"] / 2.0
     lp_eff = min(lp, nyq - 5.0)
     print(f"  Band-pass EEG {hp:.1f}-{lp_eff:.0f} Hz (Nyquist {nyq:.0f} Hz), ECG left raw ...")
     out = raw.copy().filter(
         l_freq=hp, h_freq=lp_eff,
         picks="eeg", phase="zero", fir_design="firwin", verbose=False)
+    if notch is not None and 0 < notch < nyq:
+        lo, hi = notch - 1.0, notch + 1.0
+        print(f"  Applying Notch filter {notch:.1f} Hz ({lo:.0f}-{hi:.0f} Hz) to EEG channels ...")
+        # notch_widths=2.0 -> stop-band 49-51 Hz (MNE default freq/200 would be only 0.25 Hz)
+        out.notch_filter(freqs=[notch], picks="eeg", notch_widths=2.0,
+                         fir_design="firwin", verbose=False)
     return out
 
 

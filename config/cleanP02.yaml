@@ -39,7 +39,8 @@ bands:
 # -----------------------------------------------------------------------------
 filter:
   hp: 1.0     # Гц, high-pass (убирает дрейф/пот; важно для OBS и ICA)
-  lp: 80.0    # Гц, low-pass (45 Гц срезает гребёнку гелиевой помпы 44-100 Гц)
+  lp: 80.0    # Гц, low-pass
+  notch: 50.0 # Гц, Notch-фильтр сетевой наводки (50 Гц, полоса 49-51 Гц)
 
 # -----------------------------------------------------------------------------
 # step08: BCG (EEGLAB fMRIB, Optimal Basis Set)
@@ -87,9 +88,9 @@ iclabel:
   # Бэкенд ICLabel: "python" (mne-icalabel, быстро и стабильно) или "matlab"
   backend: python
   # IC класса 'Other' удаляется, только если P(Brain) < этого значения
-  other_brain_max: 0.02
-  # Максимум компонент ICA (увеличение до 65 изолирует кардио-гармоники без потери альфы)
-  ica_pca_max: 65
+  other_brain_max: 0.08
+  # Максимум компонент ICA (95 = полный ранг, изолирует все гармоники шума)
+  ica_pca_max: 95
 
 # -----------------------------------------------------------------------------
 # step11: финальная ICA на всём сегменте
@@ -105,9 +106,23 @@ ica_final:
     channel_crit: "off"  # По умолчанию каналы не удаляются (сохраняются все сенсоры)
     line_crit: "off"     # Линейный шум убирается фильтром/ICA, не удаляя каналы (Fz, C3)
     iclabel_thresh: 0.75
-    burst_crit: 25.0     # ASR чистит всплески во времени без вырезания каналов
+    burst_crit: 20.0     # ASR чистит всплески во времени без вырезания каналов
+  # Режим отбраковки компонент:
+  #   "thresholds" - универсальные пороги классов ICLabel (подобраны через Optuna)
+  #   "meta_model" - обученный регулярный мета-классификатор (config/ica_meta_model.json)
+  # rejection_mode: "thresholds"
+  rejection_mode: "meta_model"
   # Принудительно перекрыть отдельные параметры поверх step10:
-  force_params: {burst_crit: 25.0}
+  force_params:
+    burst_crit: 20.0
+    thresh_other: 0.60
+    other_brain_max: 0.10
+    thresh_muscle: 0.45
+    thresh_line_chan: 0.85
+    thresh_eye: 0.80
+    thresh_heart: 0.65
+    max_brain_prob: 0.12
+    max_rej_fraction: 0.12
   # Защита от перечистки
   guards:
     min_iclabel_thresh: 0.65

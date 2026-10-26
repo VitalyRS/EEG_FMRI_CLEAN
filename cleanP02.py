@@ -70,8 +70,8 @@ IN_SUFFIX = "_bergen_250hz"
 STEPS = ["bcg", "ica_opt", "ica_final"]
 SEGMENT_ORDER = ["ec", "eo", "drone", "lasertag", "video"]
 ICA_PARAM_KEYS = ["flatline_crit", "channel_crit", "line_crit", "iclabel_thresh", "burst_crit", "ica_hp_hz",
-                  "thresh_eye", "thresh_heart", "thresh_muscle", "thresh_line_chan", "r_ecg_thresh",
-                  "max_brain_prob", "max_rej_fraction"]
+                  "thresh_eye", "thresh_heart", "thresh_muscle", "thresh_line_chan", "thresh_other", "other_brain_max", "r_ecg_thresh",
+                  "max_brain_prob", "max_rej_fraction", "manual_reject_ics", "rejection_mode"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -109,6 +109,7 @@ PARAM_MAP: dict[tuple, list] = {
     ("bands", "alpha"): [(s08, "ALPHA_BAND", _band), (s10, "ALPHA_BAND", _band), (s11, "ALPHA_BAND", _band)],
     ("filter", "hp"): [(s08, "FILTER_HP", float)],
     ("filter", "lp"): [(s08, "FILTER_LP", float)],
+    ("filter", "notch"): [(s08, "FILTER_NOTCH", lambda v: float(v) if (v and str(v).lower() != "off") else None)],
     ("bcg", "npc_grid"): [(s08, "NPC_GRID", _ints)],
     ("bcg", "alpha_gate_min"): [(s08, "ALPHA_GATE_MIN", float)],
     ("bcg", "min_cardiac_suppr"): [(s08, "MIN_CARDIAC_SUPPR", float)],
@@ -151,6 +152,7 @@ ORCH_KEYS = {
     ("run", "steps", "ica_final"), ("run", "force"), ("run", "rerun_on_config_change"),
     ("run", "continue_on_error"), ("bcg", "fixed_npc"),
     ("ica_final", "use_optimized_params"), ("ica_final", "force_params"),
+    ("ica_final", "rejection_mode"),
     ("output", "export_set"), ("output", "report_dir"),
     ("cleanup", "delete_prebcg_fif"), ("cleanup", "delete_ica_opt_workdir"),
     ("qc", "min_bcg_cardiac_suppression"), ("qc", "min_bcg_alpha_retention"),
@@ -359,13 +361,15 @@ def run_ica_opt(sp: SegPaths, cfg: dict):
 def ica_final_override(cfg: dict) -> dict:
     fin = cfg.get("ica_final") or {}
     override = {}
+    if "rejection_mode" in fin:
+        override["rejection_mode"] = str(fin["rejection_mode"]).strip().lower()
     if not fin.get("use_optimized_params", True):
         override.update(fin.get("defaults") or {})
     override.update(fin.get("force_params") or {})
     for k in ("burst_crit", "channel_crit", "flatline_crit", "line_crit"):
         if k in override:
             override[k] = _crit(override[k])
-    return {k: (override[k] if k in ("burst_crit", "channel_crit", "flatline_crit", "line_crit") else float(override[k]))
+    return {k: (override[k] if k in ("burst_crit", "channel_crit", "flatline_crit", "line_crit", "manual_reject_ics", "rejection_mode") else float(override[k]))
             for k in override if k in ICA_PARAM_KEYS}
 
 

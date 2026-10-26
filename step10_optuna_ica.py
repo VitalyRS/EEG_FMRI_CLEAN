@@ -890,8 +890,8 @@ def optuna_target_signal_optimization(
     def objective(trial: optuna.Trial) -> float:
         thresh_eye = trial.suggest_float("thresh_eye", 0.60, 0.85, step=0.05)
         thresh_heart = trial.suggest_float("thresh_heart", 0.55, 0.85, step=0.05)
-        thresh_muscle = trial.suggest_float("thresh_muscle", 0.75, 0.95, step=0.05)
-        thresh_line_chan = trial.suggest_float("thresh_line_chan", 0.70, 0.90, step=0.05)
+        thresh_muscle = trial.suggest_float("thresh_muscle", 0.65, 0.90, step=0.05)
+        thresh_line_chan = trial.suggest_float("thresh_line_chan", 0.65, 0.85, step=0.05)
         r_ecg_thresh = trial.suggest_float("r_ecg_thresh", 0.20, 0.35, step=0.05)
         max_brain_prob = trial.suggest_float("max_brain_prob", 0.15, 0.25, step=0.05)
         max_rej_fraction = trial.suggest_float("max_rej_fraction", 0.15, 0.30, step=0.05)

@@ -1,265 +1,323 @@
 # 🧠 Modular EEG-fMRI Cleaning Pipeline: Step 01 to Step 12
 
-**High-precision modular software pipeline for concurrent EEG-fMRI gradient artifact removal (Bergen AAS), BCG (ballistocardiogram) OBS cleaning, in-place ASR burst repair, and Picard ICA with ICLabel auto-classification and quantitative alpha rhythm preservation control.**
+**Высокоточный модульный программный конвейер для одновременного удаления градиентного артефакта МРТ (Bergen AAS), баллистокардиограммы (fMRIB OBS), подавления сетевой наводки (50 Гц Notch), мягкой локальной реконструкции всплесков (in-place ASR) и полноранговой независимой компонентной декомпозиции (Picard ICA 95 ch) с автоклассификацией ICLabel (на основе порогов или регуляризованной мета-модели) и строгим сохранением физиологических ритмов мозга (альфа 8–13 Гц).**
 
 ---
 
-## 📋 Pipeline Architecture & Workflow
+## 📋 Архитектура и этапы пайплайна
 
-The pipeline is split into two major production stages (**P01** and **P02**), with single-step modular runners and orchestrators:
+Пайплайн разделен на два основных производственных этапа (**P01** и **P02**), а также содержит модульные скрипты шагов (Step 01–12), бенчмарки и GUI для визуального сравнения сигналов:
 
 ```
-Raw EEG (5000 Hz) + fMRI Motion (rp_*.txt)
+Сырая ЭЭГ (5000 Гц) + параметры движения МРТ (rp_*.txt)
   │
-  ▼ [Stage P01: cleanP01.py / run_all.py (Steps 01-07)]
-  ├─ 01: detect MRI sessions & match SPM motion files
-  ├─ 02: sub-sample slice phase offset detection
-  ├─ 03: dummy scan trimming & volume alignment
-  ├─ 04: Optuna Bayesian tuning of Bergen AAS parameters
-  ├─ 05: 96-channel Bergen AAS cleaning (5000 Hz)
-  ├─ 06: Welch PSD spectral analysis & alpha preservation
-  ├─ 07: Bergen HTML QC report
-  └─ P01 Resample: 5000 Hz ➔ 250 Hz (data/<sid>/derivatives/02_resampled250/)
+  ▼ [Стадия P01: cleanP01.py / run_all.py (Шаги 01–07)]
+  ├─ 01: автоопределение границ сессий МРТ по RMS и сопоставление файлов движения SPM
+  ├─ 02: субсэмпловая детекция фазового сдвига срезов МРТ
+  ├─ 03: тримминг холостых сканов (dummy scans) и выравнивание таймингов
+  ├─ 04: Optuna байесовская оптимизация параметров Bergen AAS для канала Oz
+  ├─ 05: полноканальная очистка Bergen AAS (5000 Гц, float32, MATLAB Engine)
+  ├─ 06: спектральный анализ Welch PSD и контроль сохранности альфа-ритма
+  ├─ 07: генерация интерактивного HTML QC-отчета по градиентной очистке
+  └─ P01 Resample: понижение частоты 5000 Гц ➔ 250 Гц (data/<sid>/derivatives/02_resampled250/)
   │
-  ▼ [Stage P02: cleanP02.py (Steps 08, 10, 11)]
-  ├─ 08: fMRIB Optimal Basis Set (OBS) BCG removal (03_bcg/<seg>_bcg_clean.fif)
-  ├─ 10: Fast Two-Phase optimization of clean_rawdata, ASR & ICLabel thresholds
-  ├─ 11: Final cleaning: in-place ASR reconstruction + Picard ICA + ICLabel rejection
-  └─ 12: Multi-stage interactive HTML report dashboard
+  ▼ [Стадия P02: cleanP02.py (Шаги 08, 10, 11)]
+  ├─ 08: Фильтрация: Bandpass 1.0–80.0 Гц + Notch 50 Гц (49–51 Гц)
+  │      + удаление BCG через fMRIB Optimal Basis Set (OBS) (03_bcg/<seg>_bcg_clean.fif)
+  ├─ 10: Быстрый двухфазный подбор параметров ASR и порогов ICLabel на пилотном окне
+  ├─ 11: Финальная чистка всего сегмента:
+  │      ├─ Мягкая реконструкция всплесков во времени (in-place ASR, BurstCriterion=20.0)
+  │      ├─ Picard ICA полного ранга (95 независимых компонент)
+  │      ├─ Отбраковка компонент: режим "thresholds" или регуляризованная "meta_model"
+  │      ├─ Детектор остаточного BCG по QRS-синхронности компонент
+  │      ├─ Перевод к общему усредненному референсу (Average Reference, CAR)
+  │      └─ Экспорт паспорта воспроизводимости pipeline_info.yaml (+ ica_meta_model.json)
+  └─ 12: Итоговый сводный HTML дашборд со спектрами и топокартами
   │
   ▼
-Clean 250 Hz EEG Dataset: .fif (MNE) and .set (EEGLAB)
+Итоговый чистый датасет: .fif (MNE) и .set (EEGLAB) + полная история процессинга
 ```
 
 ---
 
-## 🛡️ Channel Preservation & Gentle Cleaning Policy (New)
+## 🛡️ Ключевые принципы сохранения сигнала (Gentle Cleaning Policy)
 
-Previous versions of EEG cleaning algorithms frequently over-removed channels using aggressive neighbor-correlation criteria (`ChannelCriterion >= 0.80`) or over-rejected 60–80% of ICA components, destroying brain variance and alpha rhythm.
-
-**The pipeline now adopts a strict gentle-cleaning protocol:**
-1. **`channel_crit: "off"` by default**: The algorithm does **not** delete channels based on spatial correlation. Channels are preserved intact across all 95 electrodes.
-2. **PCA Dimensionality Reduction (`ica_pca_max: 35`)**: Stabilizes ICA on ~95 channels by projecting data into the top 35 principal components prior to decomposition. This completely prevents component splitting and keeps independent sources stable.
-3. **Low-Pass Filter (`filter.lp: 45.0 Hz`)**: Effectively cuts the mechanical helium-pump vibration harmonic comb (44–100 Hz), which Bergen AAS cannot eliminate because it is not gradient-locked.
-4. **In-place ASR Reconstruction (`burst_crit: 25.0`)**: High-variance transient bursts (jaw clenches, head motion spikes) are gently repaired in-place by Artifact Subspace Reconstruction (ASR) with `BurstRejection = 'off'`. No channels are removed and no time intervals are cut.
-5. **Balanced ICLabel Rejection Rule**:
-   * Class `Other` is **preserved** (not automatically deleted, protecting non-standard cortical dipoles).
-   * Rejects only confirmed `Eye` (blinks/saccades, $\ge 0.70$), `Heart` (residual BCG, $\ge 0.70$), `Line` / `Channel` noise ($\ge 0.75$), and high-confidence `Muscle` ($P \ge 0.80$ with $P(\text{Brain}) < 0.10$).
-   * **Over-cleaning Guard**: A strict ceiling guarantees that **no more than 35% of components** can ever be rejected.
-6. **Automatic Provenance & Reproducibility (`pipeline_info.yaml`)**:
-   Every cleaned folder (`data/<sid>/derivatives/05_ica/<seg>/`) automatically receives a `pipeline_info.yaml` with the exact Git branch, commit hash, data provenance (input/output paths), cleaning metrics, and full config snapshot.
+1. **Сохранение всех 95 каналов (`channel_crit: "off"`)**:
+   - В отличие от стандартных агрессивных пайплайнов, отбрасывающих до 10–20% электродов по пространственной корреляции, здесь каналы не удаляются. Сигнал на всех датчиках сохраняется для последующего сорсинга и топографического анализа.
+2. **Подавление сетевой наводки (50 Гц Notch) и расширенный диапазон 80 Гц**:
+   - Полосовой фильтр настроен на 1.0–80.0 Гц (захватывает гамма-диапазон), а сетевая гармоника 50 Гц (49–51 Гц) подавляется специализированным FIR Notch-фильтром без размывания близлежащих частот.
+3. **Полноранговая декомпозиция ICA (`ica_pca_max: 95`)**:
+   - Раскладывает 95 каналов на 95 независимых компонент. Это позволяет изолировать мелкие высокочастотные артефакты крионасоса, миографию отдельных мышц и сердечные пики, не расщепляя корковые ритмы.
+4. **Мягкая реконструкция всплесков (In-place ASR `burst_crit: 20.0`)**:
+   - Артефакты движения челюсти или головы мягко восстанавливаются методом Artifact Subspace Reconstruction во временной области (`BurstRejection = 'off'`). Временные окна не вырезаются, длительность записи сохраняется неизменной.
+5. **Два режима отбраковки компонент (`rejection_mode`)**:
+   - **`thresholds`**: Набор непрерывных порогов по классам ICLabel, оптимизированный когортной Optuna (высокая точность детекции артефактов).
+   - **`meta_model`**: Обученная логистическая мета-модель на 10 признаках каждого IC (вероятности классов, энтропия, уверенность, относительная мощность), протестированная через Leave-One-Subject-Out (LOSO) кросс-валидацию без переобучения. Имеет строго отрицательный вес для коркового ритма ($w_{\text{brain}} = -1.38$), защищающий физиологический сигнал.
 
 ---
 
-## 🚀 Execution Guide: Common Scenarios & Examples
+## 🚀 Подробное руководство по запуску скриптов
 
-### 1️⃣ Сценарий 1: Полная обработка с нуля (From Scratch: 5000 Hz `.vhdr` / `.eeg`)
+### 1️⃣ Главный оркестратор этапа P02: `cleanP02.py`
 
-Если у вас есть только исходные записи в `EEG_ORIGINAL_ROOT`:
+Скрипт `cleanP02.py` выполняет этапы BCG (Step 08), оптимизации ICA (Step 10) и финальной очистки (Step 11).
 
-#### Вариант А: Рекомендуемый двухстадийный батч (P01 ➔ P02)
-Этот вариант автоматически очищает тяжёлые промежуточные файлы 5000 Гц (~1 ГБ на сегмент) после ресемплинга:
+#### Базовые примеры запуска
+
 ```bash
-# Шаг 1: Градиентный артефакт (Bergen AAS) + ресемплинг 5000 -> 250 Гц
-python cleanP01.py --subjects 1916
-
-# Шаг 2: BCG (OBS) + оптимизация ICA + финальная чистка (сохраняя каналы)
+# Обработка одного испытуемого (все сегменты: ec, eo, drone, lasertag, video)
 python cleanP02.py --subjects 1916
 
-# Или запустить пакетно для всех испытуемых:
-python cleanP01.py --all
+# Обработка нескольких испытуемых подряд
+python cleanP02.py --subjects 1916 1917 1924
+
+# Обработка только конкретных сегментов
+python cleanP02.py --subjects 1916 --segments drone lasertag
+
+# Обработка ВСЕХ испытуемых, у которых готовы данные 250 Гц
 python cleanP02.py --all
 ```
 
-#### Вариант Б: Монолитный оркестратор `run_all.py` (Шаги 01–12)
-```bash
-# Обработать одного субъекта:
-python run_all.py --subject 1916
+#### Принудительный пересчет и пропуск шагов
 
-# Обработать одного субъекта с принудительным пересчётом с нуля:
+```bash
+# Принудительный пересчет ВСЕХ шагов (BCG + ICA) с нуля:
+python cleanP02.py --subjects 1916 --recalc
+
+# Пересчитать ТОЛЬКО финальный шаг ICA (ica_final), используя уже готовый BCG:
+python cleanP02.py --subjects 1916 --force ica_final
+
+# Пересчитать шаг BCG и финальный шаг ICA:
+python cleanP02.py --subjects 1916 --force bcg ica_final
+
+# Пропустить шаг BCG и выполнить только ICA:
+python cleanP02.py --subjects 1916 --set run.steps.bcg=false
+```
+
+#### Предварительный просмотр (Dry-Run) и пересборка отчетов
+
+```bash
+# Проверить план выполнения без реального запуска расчетов:
+python cleanP02.py --subjects 1916 --dry-run
+
+# Только пересобрать сводные HTML-отчеты по уже очищенным данным:
+python cleanP02.py --subjects 1916 --report-only
+```
+
+#### Динамическое переопределение параметров через `--set`
+
+Любой параметр из `config/cleanP02.yaml` можно переопределить в командной строке без редактирования файла:
+
+```bash
+# Включить мета-модель отбраковки вместо порогов:
+python cleanP02.py --subjects 1916 --segments drone --set ica_final.rejection_mode=meta_model
+
+# Переопределить порог ASR burst_crit:
+python cleanP02.py --subjects 1916 --set ica_final.defaults.burst_crit=20.0
+
+# Задать фиксированное число компонент BCG OBS (например, 4 компоненты):
+python cleanP02.py --subjects 1916 --set bcg.fixed_npc=4
+
+# Изменить частоты фильтрации на лету:
+python cleanP02.py --subjects 1916 --set filter.lp=80.0 --set filter.notch=50.0
+```
+
+---
+
+### 2️⃣ Оркестратор этапа P01 (Градиент МРТ): `cleanP01.py`
+
+Используется, когда необходимо обработать сырые данные 5000 Гц (`.vhdr` / `.eeg`), устранить градиентный артефакт Bergen AAS и выполнить ресемплинг в 250 Гц.
+
+```bash
+# Обработка одного испытуемого:
+python cleanP01.py --subjects 1916
+
+# Обработка нескольких испытуемых с увеличенным числом Optuna-итераций:
+python cleanP01.py --subjects 1916 1917 --trials 50
+
+# Пакетный запуск по всей когорте:
+python cleanP01.py --all
+
+# Сохранить тяжелые промежуточные файлы 5000 Гц (по умолчанию удаляются после ресемплинга):
+python cleanP01.py --subjects 1916 --keep-heavy
+
+# Принудительно пересчитать ресемплинг 250 Гц:
+python cleanP01.py --subjects 1916 --force-resample
+```
+
+---
+
+### 3️⃣ Монолитный сквозной оркестратор: `run_all.py`
+
+Запускает непрерывный цикл обработки с Шага 01 по Шаг 12:
+
+```bash
+# Запуск для одного испытуемого с пересчетом:
 python run_all.py --subject 1916 --recalc
 
-# Обработать один конкретный сегмент:
-python run_all.py --segment-dir data/1916/segments/ec --recalc
+# Запуск для одного конкретного сегмента:
+python run_all.py --segment-dir data/1916/segments/drone --recalc
 
-# Обработать всех субъектов в data/:
+# Запуск с пропуском шага BCG или оптимизации ICA:
+python run_all.py --subject 1916 --skip-bcg
+python run_all.py --subject 1916 --skip-ica-optuna
+
+# Запуск для всех доступных субъектов:
 python run_all.py --all
 ```
 
 ---
 
-### 2️⃣ Сценарий 2: Запуск с шага 250 Гц (`data/<subject>/derivatives/02_resampled250`)
+### 4️⃣ Запуск отдельных шагов конвейера (Step 01 – Step 12)
 
-Если градиентный артефакт уже устранён и данные ресемплированы в 250 Гц (файлы `data/<subject>/derivatives/02_resampled250/<seg>/<seg>_250hz.fif`):
-
-**Вам не нужно запускать Шаги 01–07!** Можно сразу стартовать с этапа P02:
+Каждый шаг может быть запущен автономно для точечной отладки:
 
 ```bash
-# 1. Запустить P02 для одного субъекта (автоматически подхватит 02_resampled250):
-python cleanP02.py --subjects 1916
+# Шаг 01: Детекция включения градиентов МРТ и сопоставление файлов движения SPM
+python step01_detect_mri.py --vhdr /path/to/raw_recording.vhdr --subject 1916
 
-# 2. Принудительный пересчёт всех шагов P02 (BCG + ICA):
-python cleanP02.py --subjects 1916 --recalc
-# (или эквивалентно: python cleanP02.py --subjects 1916 --force)
+# Шаг 02: Субсэмпловая детекция фазы среза
+python step02_detect_slices.py --segment-dir data/1916/segments/drone
 
-# 3. Запустить только для выбранных сегментов:
-python cleanP02.py --subjects 1916 --segments ec eo
+# Шаг 03: Обрезка холостых сканов (Dummy Scans)
+python step03_trim_dummy.py --segment-dir data/1916/segments/drone --dummy 5
 
-# 4. Запустить для всех испытуемых, у которых есть папка 02_resampled250:
-python cleanP02.py --all
+# Шаг 04: Подбор параметров Bergen AAS через Optuna
+python step04_optuna_tune.py --subject 1916 --segment drone --trials 30
 
-# 5. Проверить план выполнения без реального запуска (Dry-run):
-python cleanP02.py --subjects 1916 --dry-run
-```
+# Шаг 05: Полноканальная очистка Bergen AAS (5000 Гц)
+python step05_bergen_clean.py --subject 1916 --segment drone
 
-#### Запуск отдельными скриптами по шагам:
-```bash
-# Шаг 08: Удаление BCG (fMRIB OBS). Автоматически читает 02_resampled250/<seg>_250hz.fif
-python step08_bcg.py --subject 1916 --segment ec
+# Шаг 06: Спектральный анализ альфа-ритма после Bergen AAS
+python step06_spectra_analysis.py --subject 1916 --segment drone
 
-# Шаг 10: Подбор параметров ICA на BCG-очищенных данных (03_bcg)
-python step10_optuna_ica.py --subject 1916 --segment ec
+# Шаг 07: HTML-отчет по градиентной очистке
+python step07_html_report.py --subject 1916 --segment drone
 
-# Шаг 11: Финальная ICA + ASR + ICLabel на всём сегменте (05_ica)
-python step11_ica_final.py --subject 1916 --segment ec
+# Шаг 08: Очистка баллистокардиограммы (BCG OBS 250 Гц)
+python step08_bcg.py --subject 1916 --segment drone
 
-# Шаг 12: Сводный HTML-отчёт
-python step12_summary_report.py --subject 1916 --segment ec
-```
+# Шаг 10: Подбор параметров ASR и порогов ICLabel
+python step10_optuna_ica.py --subject 1916 --segment drone
 
----
+# Шаг 11: Финальная чистка ICA + ASR + ICLabel на всем сегменте
+python step11_ica_final.py --subject 1916 --segment drone
 
-### 3️⃣ Сценарий 3: Запуск с этапа BCG (`data/<subject>/derivatives/03_bcg`)
-
-Если BCG уже посчитан (`<seg>_bcg_clean.fif`), но вы хотите пересчитать только ICA (например, с новыми щадящими настройками сохранения каналов):
-
-```bash
-# Пропустить шаг BCG и выполнить только ICA:
-python cleanP02.py --subjects 1916 --set run.steps.bcg=false
-
-# Принудительно пересчитать финальный шаг ICA (ica_final):
-python cleanP02.py --subjects 1916 --force ica_final
-
-# Запустить с переопределением параметров из командной строки:
-python cleanP02.py --subjects 1916 --set ica_final.defaults.burst_crit=20.0
+# Шаг 12: Итоговый сводный HTML-отчет
+python step12_summary_report.py --subject 1916 --segment drone
 ```
 
 ---
 
-## ⚙️ Управление параметрами через `config/cleanP02.yaml`
+### 5️⃣ Инструменты бенчмаркинга, оптимизации и мета-модели (`analysis_dima/`)
 
-Все параметры стадий BCG и ICA вынесены в [config/cleanP02.yaml](config/cleanP02.yaml).
+Специализированные инструменты для сравнения результатов с эталонной ручной/полуавтоматической очисткой Димы (`data_dima/`), когортного поиска оптимума и обучения классификатора:
 
-| Параметр | Значение | Описание |
-|---|:---:|---|
-| `iclabel.ica_pca_max` | `35` | PCA-редукция до 35 компонент перед ICA: предотвращает расщепление компонент и переочистку |
-| `filter.hp` / `filter.lp` | `1.0` / `45.0` | Полосовой фильтр (45.0 Гц полностью срезает вибрационную гребёнку крионасоса МРТ 44–100 Гц) |
-| `bcg.npc_grid` | `[1, 2, 3]` | Сетка компонент fMRIB OBS ($\le 3$ эффективно убирает пульс и сохраняет альфа-ритм) |
-| `ica_final.defaults.channel_crit` | `"off"` | Отключение удаления каналов по корреляции с соседями (все 95 каналов сохраняются) |
-| `ica_final.defaults.burst_crit` | `25.0` | Порог ASR (SD cutoff): локально и мягко восстанавливает всплески движения во времени |
-| `ica_final.defaults.iclabel_thresh` | `0.75` | Порог вероятности ICLabel для удаления артефактных компонент |
-| `ica_opt.max_channel_removal_fraction` | `0.05` | Жёсткий лимит: выбрасывать не более 5% каналов (макс ~4–5) |
-| `ica_final.guards.max_channel_crit` | `0.70` | Защита от перечистки: блокирует агрессивные значения порога удаления каналов |
-
-Вы можете переопределять параметры прямо в командной строке:
 ```bash
-python cleanP02.py --subjects 1916 --set bcg.fixed_npc=3 --set ica_final.defaults.burst_crit=25.0
+# 1. Сравнение очищенных данных пайплайна с эталоном Димы (расчет r, RMSE, PSD):
+python analysis_dima/compare_dima.py --sid 1916 1917 1924 1925 --seg drone lasertag
+
+# 2. Когортная Optuna-оптимизация порогов ICLabel по 12 эталонным записям:
+python analysis_dima/tune_optuna_benchmark.py --trials 1000 --min_alpha 0.80
+
+# 3. Обучение регулярной мета-модели отбраковки компонент (LOSO кросс-валидация):
+python analysis_dima/train_meta_classifier.py
+
+# 4. Проверка согласованности детекции QRS-комплексов с эталоном:
+python analysis_dima/qrs_agreement.py --sid 1916 1917 --seg drone lasertag
+
+# 5. Тестовый перенос очистки BCG из эталона:
+python analysis_dima/bcg_transplant.py --sid 1916 --seg drone
 ```
 
 ---
 
-## 📂 Структура директорий и производных (`derivatives`)
+### 6️⃣ Интерактивное GUI-приложение для визуального сравнения сигналов
+
+Для поканального наложения и визуальной инспекции временных рядов и спектров разработан интерактивный инструмент на PyQt / matplotlib:
+
+```bash
+python file_compareandvis/eeg_compare_app.py
+```
+**Возможности приложения:**
+- Одновременное наложение сигналов: *Сырая ЭЭГ*, *Очищенная ЭЭГ пайплайна*, *Эталон Димы*.
+- Сравнение спектров мощности (Welch PSD) в реальном времени для выбранных каналов.
+- Инспекция топографических карт и карточек отдельных каналов.
+
+---
+
+## ⚙️ Структура конфигурационного файла `config/cleanP02.yaml`
+
+Основные блоки настроек этапа P02:
+
+```yaml
+# Частотная фильтрация
+filter:
+  hp: 1.0        # High-pass (Гц)
+  lp: 80.0       # Low-pass (Гц, расширенная полоса до 80 Гц)
+  notch: 50.0    # Notch-фильтр 50 Гц (полоса 49-51 Гц)
+
+# Баллистокардиограмма fMRIB OBS
+bcg:
+  npc_grid: [2, 3, 4, 5, 6, 7]  # Диапазон перебора числа компонент OBS
+  fixed_npc: null               # Если указано число — перебор отключается
+  alpha_gate_min: 0.75          # npc допускается, только если сохраняет >= 75% альфы
+
+# Декомпозиция ICA
+iclabel:
+  backend: python               # mne-icalabel
+  ica_pca_max: 95               # 95 компонент (полный ранг для 95 каналов)
+  other_brain_max: 0.08
+
+# Финальная чистка (Step 11)
+ica_final:
+  use_optimized_params: true
+  rejection_mode: "meta_model"  # "meta_model" или "thresholds"
+  defaults:
+    channel_crit: "off"         # Все каналы сохраняются
+    burst_crit: 20.0            # Порог мягкой реконструкции ASR во времени
+    iclabel_thresh: 0.75
+  cardiac_qrs:
+    ratio_thresh: 0.05          # Детектор остаточного BCG по QRS-синхронности
+    max_ics: 4
+```
+
+---
+
+## 📂 Структура каталогов и производных данных (`derivatives`)
 
 ```
 data/
-└── <subject_id>/                       # e.g., 1916, 1924, 1929
+└── <subject_id>/                       # Например: 1916, 1917, 1924, 1925
     ├── segments/<seg>/                 # ec, eo, drone, lasertag, video
-    │   ├── optuna_ica_best_params.json # Выигравшие параметры ICA (Шаг 10)
-    │   └── optuna_ica_result.png       # График оптимизации Шага 10
+    │   ├── optuna_ica_best_params.json # Параметры ICA, подобранные на Шаге 10
+    │   └── optuna_ica_result.png       # График оптимизации
     │
     └── derivatives/
-        ├── 01_bergen/<seg>/            # Шаг 05: Bergen AAS 5000 Hz (.set)
-        ├── 01_bergen_250hz/<seg>/      # P01: Bergen AAS 250 Hz (.fif)
-        ├── 02_resampled250/<seg>/      # Ресемплированные данные 250 Hz (<seg>_250hz.fif)
-        ├── 03_bcg/<seg>/               # Шаг 08: BCG-очищенные данные (<seg>_bcg_clean.fif)
-        ├── 04_channels/<seg>/          # Шаг 11: removed_channels.json (список удалённых каналов)
-        └── 05_ica/<seg>/               # Шаг 11: Финальные данные:
-            ├── <seg>_ica_clean.fif     #   - MNE чистые данные
-            ├── <seg>_ica_clean.set     #   - EEGLAB чистые данные
-            ├── <seg>_ica_report.html   #   - Интерактивный HTML-отчёт
-            ├── <seg>_ica_metrics.json  #   - Числовые метрики очистки
+        ├── 01_bergen/<seg>/            # Шаг 05: Bergen AAS 5000 Гц (.set)
+        ├── 01_bergen_250hz/<seg>/      # P01: Bergen AAS 250 Гц (.fif)
+        ├── 02_resampled250/<seg>/      # Ресемплированные данные 250 Гц (<seg>_250hz.fif)
+        ├── 03_bcg/<seg>/               # Шаг 08: BCG OBS чистые данные (<seg>_bcg_clean.fif)
+        ├── 04_channels/<seg>/          # Шаг 11: removed_channels.json (сохранность каналов)
+        └── 05_ica/<seg>/               # Шаг 11: Финальные результаты очистки:
+            ├── <seg>_ica_clean.fif     #   - MNE-формат (250 Гц, CAR-референс)
+            ├── <seg>_ica_clean.set     #   - EEGLAB-формат с координатами электродов
+            ├── <seg>_ica_report.html   #   - Интерактивный HTML-отчет со спектрами
+            ├── <seg>_ica_metrics.json  #   - Метрики: сохранность альфы, отброшенные IC
+            ├── ica_meta_model.json     #   - Копия мета-модели (при rejection_mode: meta_model)
             └── pipeline_info.yaml      #   - Паспорт воспроизводимости (Git коммит, ветка, пути, конфиг)
 ```
 
 ---
 
-## 📖 Подробное описание каждого шага (Step 01 – Step 12)
+## 📊 Целевые критерии качества очистки (Quality Targets)
 
-### [STEP 01] Детекция МРТ-сессий (`step01_detect_mri.py`)
-- **Цель**: Автоматический поиск границ включения градиентов МРТ по RMS-огибающей непрерывной 5000 Гц записи.
-- Фильтрует короткие калибровочные импульсы (`MIN_NAMED_SEC = 250.0s`).
-- Сортирует файлы движения SPM (`rp_*.txt`) и сопоставляет их с сегментами: `ec -> eo -> drone -> lasertag -> video`.
-
-### [STEP 02] Субсэмпловая фаза срезов (`step02_detect_slices.py`)
-- **Цель**: Кросс-корреляция профиля импульсов с гребёнчатым шаблоном периода среза (100 мс = 500 отсчётов при 5000 Гц).
-- Выход: `slice_detection.json`.
-
-### [STEP 03] Обрезка холостых сканов (Dummy Scans) (`step03_trim_dummy.py`)
-- **Цель**: Синхронизация начала ЭЭГ с началом реальных функциональных объёмов fMRI и отсечение переходных сканов.
-- Выход: `slice_triggers.txt`, `segment_work_info.json`.
-
-### [STEP 04] Оптимизация параметров Bergen AAS (`step04_optuna_tune.py`)
-- **Цель**: Байесовская оптимизация параметров фазового сдвига (`shift`), окна усреднения (`win_k`) и порога движения (`motion_thresh`) на затылочном канале `Oz`.
-
-### [STEP 05] Полноканальная чистка Bergen AAS (`step05_bergen_clean.py`)
-- **Цель**: Подавление градиентного артефакта на всех 96 каналах в MATLAB с экономией памяти (`float32`).
-
-### [STEP 06] Спектральный анализ альфа-ритма (`step06_spectra_analysis.py`)
-- **Цель**: Оценка подавления гармоник градиента (20, 30, 40, 50, 60 Гц) и сохранности альфа-ритма (8–13 Гц).
-
-### [STEP 07] HTML-отчёт Bergen (`step07_html_report.py`)
-- **Цель**: Генерация интерактивного отчёта о качестве удаления градиентного артефакта.
-
-### [STEP 08] Удаление баллистокардиограммы (BCG) (`step08_bcg.py`)
-- **Цель**: 
-  1. Чтение 250 Гц данных (из `02_resampled250` или даунсэмплинг из 5000 Гц `.set`).
-  2. Полосовой фильтр 1.0–45.0 Гц (1.0 Гц полностью убирает дыхательный дрейф; 45.0 Гц срезает гармоническую гребенку крионасоса томографа).
-  3. Детекция QRS-пиков кардиоканала в fMRIB (`fmrib_pas`).
-  4. Подбор оптимального числа компонент базиса (`npc = 1..3`) с контролем сохранения альфа-ритма.
-- Выход: `derivatives/03_bcg/<seg>/<seg>_bcg_clean.fif`.
-
-### [STEP 10] Быстрая двухфазная оптимизация ICA (`step10_optuna_ica.py`)
-- **Цель**: 
-  - **Фаза 1**: Сетка `clean_rawdata` с приоритетом сохранения каналов (`channel_grid: ["off"]`).
-  - **Фаза 2**: Однократный запуск Picard ICA с PCA-редукцией до 35 компонент (`ica_pca_max = 35`).
-  - **Фаза 3**: Быстрый подбор порога ICLabel (0.70–0.85) по сбалансированным правилам (сохранение класса Other, удаление подтверждённых артефактов).
-- Выход: `optuna_ica_best_params.json`.
-
-### [STEP 11] Финальная чистка ICA + ASR (`step11_ica_final.py`)
-- **Цель**: 
-  1. Применение ASR (`BurstCriterion = 25.0`) для мягкой реконструкции всплесков во времени без вырезания каналов.
-  2. Picard ICA с редукцией до 35 компонент на всем сегменте.
-  3. Сбалансированная классификация компонент через `mne-icalabel`: удаление артефактов (Eye, Heart, high-confidence Muscle, Line/Chan), сохранение класса `Other`, и защитный потолок (не более 35% компонент).
-  4. Сохранение всех каналов в исходном виде.
-  5. Перевод к общему усреднённому референсу (Average Reference).
-  6. Экспорт паспорта воспроизводимости `pipeline_info.yaml` (Git коммит, ветка, пути входа/выхода, конфиг).
-- Выход: `derivatives/05_ica/<seg>/<seg>_ica_clean.fif`, `.set`, и `pipeline_info.yaml`.
-
-### [STEP 12] Сводный многостадийный отчёт (`step12_summary_report.py`)
-- **Цель**: Построение интерактивного дашборда сравнения **Сырая ЭЭГ ➔ Bergen AAS ➔ BCG OBS ➔ Финальная ICA**:
-  - Наложения спектров PSD до и после каждой стадии.
-  - Метрики сохранности физиологического сигнала и подавления артефактов.
-
----
-
-## 📊 Таблица целевых критериев качества (Quality Targets)
-
-| Метрика | Целевое значение | Предупреждение / Флаг REVIEW |
-|---|:---:|:---:|
-| **Подавление градиента fMRI (20–60 Гц)** | $\ge 99.5\%$ | $< 99.0\%$ |
-| **Сохранение альфа-ритма после Bergen** | $\ge 85.0\%$ | $< 70.0\%$ |
-| **Подавление кардио-артефакта BCG (0.7–4.0 Гц)** | $\ge 25.0\%$ | $< 10.0\%$ |
-| **Сохранение альфа-ритма после BCG** | $\ge 60.0\%$ | $< 50.0\%$ |
-| **Доля удалённых IC компонент** | $20\% - 40\%$ | $> 50\%$ |
-| **Падение общей дисперсии после ICA** | $\le 40.0\%$ | $> 60\%$ |
-| **Число удалённых каналов** | **0** (все сохранены) | $> 5$ каналов |
+| Метрика | Целевой диапазон | Предупреждение (REVIEW) | Описание |
+|---|:---:|:---:|---|
+| **Подавление градиента fMRI (20–60 Гц)** | $\ge 99.5\%$ | $< 99.0\%$ | Оценивается после шага Bergen AAS |
+| **Сохранение альфа-ритма после Bergen** | $\ge 85.0\%$ | $< 70.0\%$ | Мощность в полосе 8–13 Гц на затылочных датчиках |
+| **Подавление кардио-артефакта BCG (0.7–4.0 Гц)** | $\ge 20.0\%$ | $< 10.0\%$ | Эффективность удаления QRS-баллистокардиограммы |
+| **Сохранение альфа-ритма после BCG** | $\ge 75.0\%$ | $< 60.0\%$ | Отношение спектральной плотности до и после OBS |
+| **Доля удаленных IC-компонент** | $10\% - 35\%$ | $> 40\%$ | Защита от избыточного вырезания источников |
+| **Удаленные электроды** | **0** (все 95 сохранены) | $> 5$ каналов | Принцип целостности монтажа |
+| **Корреляция с эталоном Димы ($r$)** | $\ge 0.40$ | $< 0.30$ | Средняя пространственно-временная корреляция сигналов |

@@ -15,6 +15,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import datetime
+import shutil
 import yaml
 
 try:
@@ -133,6 +134,18 @@ def save_pipeline_info(subject_id: str, seg: str, out_deriv_dir: Path,
 
     input_source = _rel(source_set) if source_set.exists() else (_rel(source_fif) if source_fif.exists() else None)
 
+    meta_src = PROJECT_ROOT / "config" / "ica_meta_model.json"
+    rejection_mode = str(params_used.get("rejection_mode", (cfg.get("ica_final", {}) if cfg else {}).get("rejection_mode", ""))).strip().lower()
+    meta_json_path = None
+    if rejection_mode == "meta_model" and meta_src.exists():
+        out_meta_json = out_deriv_dir / "ica_meta_model.json"
+        try:
+            shutil.copy2(meta_src, out_meta_json)
+            meta_json_path = _rel(out_meta_json)
+            print(f"  Saved meta-model: {out_meta_json.name}")
+        except Exception:
+            pass
+
     provenance = {
         "input_source_250hz": input_source,
         "input_bcg_fif": _rel(in_fif) if Path(in_fif).exists() else _rel(in_fif),
@@ -141,6 +154,7 @@ def save_pipeline_info(subject_id: str, seg: str, out_deriv_dir: Path,
         "output_clean_set": _rel(out_set) if out_set.exists() else None,
         "output_report_html": _rel(out_html) if out_html.exists() else None,
         "output_metrics_json": _rel(out_metrics) if out_metrics.exists() else None,
+        "meta_model_json": meta_json_path,
     }
 
     payload = {
@@ -281,12 +295,16 @@ def apply_optimized_ica(segment_dir: Path = DEFAULT_SEGMENT_DIR, force: bool = F
     iclabel_thresh = best.get("iclabel_thresh", 0.70)
     thresh_eye = float(best.get("thresh_eye", min(0.70, iclabel_thresh)))
     thresh_heart = float(best.get("thresh_heart", min(0.70, iclabel_thresh)))
-    thresh_muscle = float(best.get("thresh_muscle", max(0.80, iclabel_thresh)))
-    thresh_line_chan = float(best.get("thresh_line_chan", max(0.75, iclabel_thresh)))
+    thresh_muscle = float(best.get("thresh_muscle", min(0.65, iclabel_thresh)))
+    thresh_line_chan = float(best.get("thresh_line_chan", min(0.70, iclabel_thresh)))
+    thresh_other = float(best.get("thresh_other", 0.50))
+    other_brain_max = float(best.get("other_brain_max", 0.08))
+    manual_reject_ics = best.get("manual_reject_ics", [])
     r_ecg_thresh = float(best.get("r_ecg_thresh", 0.25))
     max_brain_prob = float(best.get("max_brain_prob", 0.20))
-    max_rej_fraction = float(best.get("max_rej_fraction", 0.20))
+    max_rej_fraction = float(best.get("max_rej_fraction", 0.25))
     ica_hp_hz = best.get("ica_hp_hz", ICA_HP_HZ)
+    rejection_mode = str(best.get("rejection_mode", "thresholds")).strip().lower()
 
     # MATLAB literal formatting: 'off' (string) or bare float
     flat_ml = "'off'" if str(flatline_crit).lower() == "off" else f"{float(flatline_crit)}"
@@ -461,34 +479,104 @@ try, java.lang.System.exit(0); catch, exit(0); end
                             ecg_corrs[c] = float(lags_r[best_idx])
                             ecg_best_lags[c] = (best_idx * 2) / sfreq * 1000.0
 
-        # Balanced rejection rule for EEG-fMRI:
-        # Classes: 0: Brain, 1: Muscle, 2: Eye, 3: Heart, 4: Line, 5: Chan, 6: Other
+        # Candidate rejection selection (supports two modes: 'thresholds' and 'meta_model')
         candidate_rejects = []
-        for c in range(n_pca):
-            probs = ic_classes[c]
-            dominant = int(np.argmax(probs))
-            max_prob = float(probs[dominant])
-            brain_prob = float(probs[0])
-            is_rej = False
+        classes_names = ["Brain", "Muscle", "Eye", "Heart", "Line", "Chan", "Other"]
 
-            if dominant == 2 and max_prob >= thresh_eye and brain_prob < max_brain_prob:  # Eye (blinks/saccades)
-                is_rej = True
-            elif (dominant == 3 or probs[3] >= thresh_heart) and brain_prob < max_brain_prob:  # Heart (residual BCG)
-                is_rej = True
-            elif ecg_corrs[c] >= r_ecg_thresh and brain_prob < max_brain_prob:  # ECG-guided BCG residual
-                is_rej = True
-                print(f"    [ECG-GUIDED] IC {c:02d}: Residual BCG detected (lagged r_ECG={ecg_corrs[c]:.3f} at lag={ecg_best_lags[c]:.0f}ms, P_brain={brain_prob:.2f})")
-            elif c in cardiac_ics:  # QRS-locked residual BCG
-                is_rej = True
-                print(f"    [QRS-LOCKED] IC {c:02d}: Residual BCG (evoked-energy ratio={qrs_ratio[c]:.3f}, P_brain={brain_prob:.2f})")
-            elif dominant in (4, 5) and max_prob >= thresh_line_chan and brain_prob < min(max_brain_prob, 0.15):  # Line or Channel noise
-                is_rej = True
-            elif dominant == 1 and max_prob >= thresh_muscle and brain_prob < min(max_brain_prob, 0.10):  # High-confidence Muscle
-                is_rej = True
+        if rejection_mode == "meta_model":
+            meta_model_path = PROJECT_ROOT / "config" / "ica_meta_model.json"
+            if meta_model_path.exists():
+                try:
+                    with open(meta_model_path, "r", encoding="utf-8") as f:
+                        mm = json.load(f)
+                    mm_weights = np.array(mm["weights"], dtype=np.float64)
+                    mm_intercept = float(mm["intercept"])
+                    mm_thresh = float(mm.get("threshold", 0.50))
+                    print(f"  [REJECTION MODE] Regularized Meta-Model ({meta_model_path.name}, threshold={mm_thresh:.2f})")
 
-            if is_rej:
-                conf_score = max_prob - brain_prob + 0.5 * ecg_corrs[c] + (1.0 + qrs_ratio[c] if c in cardiac_ics else 0.0)
-                candidate_rejects.append((c, conf_score))
+                    sources = ica.get_sources(raw_clean).get_data()
+                    var_k = np.sum(sources**2, axis=1)
+                    tot_var = np.sum(var_k) + 1e-30
+
+                    for c in range(n_pca):
+                        probs = ic_classes[c]
+                        dominant = int(np.argmax(probs))
+                        max_prob = float(probs[dominant])
+                        brain_prob = float(probs[0])
+                        gap = max_prob - brain_prob
+                        rel_var = float(var_k[c] / tot_var)
+
+                        feat = np.array([
+                            float(probs[0]), float(probs[1]), float(probs[2]), float(probs[3]),
+                            float(probs[4]), float(probs[5]), float(probs[6]),
+                            max_prob, gap, rel_var
+                        ])
+                        z = mm_intercept + float(np.dot(mm_weights, feat))
+                        prob_artifact = 1.0 / (1.0 + np.exp(-z))
+
+                        is_rej = False
+                        if prob_artifact >= mm_thresh and brain_prob < max_brain_prob:
+                            is_rej = True
+                        elif ecg_corrs[c] >= r_ecg_thresh and brain_prob < max_brain_prob:
+                            is_rej = True
+                            print(f"    [ECG-GUIDED] IC {c:02d}: Residual BCG detected (lagged r_ECG={ecg_corrs[c]:.3f} at lag={ecg_best_lags[c]:.0f}ms, P_brain={brain_prob:.2f})")
+                        elif c in cardiac_ics:
+                            is_rej = True
+                            print(f"    [QRS-LOCKED] IC {c:02d}: Residual BCG (evoked-energy ratio={qrs_ratio[c]:.3f}, P_brain={brain_prob:.2f})")
+
+                        if is_rej:
+                            candidate_rejects.append((c, prob_artifact))
+                            print(f"    [META-MODEL] IC {c:02d}: P(artifact)={prob_artifact:.3f} (Class={classes_names[dominant]} {max_prob:.2f}, Brain={brain_prob:.2f})")
+                except Exception as e:
+                    print(f"  [WARN] Failed loading meta-model ({e}); falling back to universal thresholds")
+                    rejection_mode = "thresholds"
+            else:
+                print(f"  [WARN] {meta_model_path} not found; falling back to universal thresholds")
+                rejection_mode = "thresholds"
+
+        if rejection_mode != "meta_model":
+            print(f"  [REJECTION MODE] Universal Thresholds (Optuna: other={thresh_other:.2f}, muscle={thresh_muscle:.2f}, line/chan={thresh_line_chan:.2f}, eye={thresh_eye:.2f}, heart={thresh_heart:.2f})")
+            for c in range(n_pca):
+                probs = ic_classes[c]
+                dominant = int(np.argmax(probs))
+                max_prob = float(probs[dominant])
+                brain_prob = float(probs[0])
+                is_rej = False
+
+                if dominant == 2 and max_prob >= thresh_eye and brain_prob < max_brain_prob:  # Eye (blinks/saccades)
+                    is_rej = True
+                elif (dominant == 3 or probs[3] >= thresh_heart) and brain_prob < max_brain_prob:  # Heart (residual BCG)
+                    is_rej = True
+                elif ecg_corrs[c] >= r_ecg_thresh and brain_prob < max_brain_prob:  # ECG-guided BCG residual
+                    is_rej = True
+                    print(f"    [ECG-GUIDED] IC {c:02d}: Residual BCG detected (lagged r_ECG={ecg_corrs[c]:.3f} at lag={ecg_best_lags[c]:.0f}ms, P_brain={brain_prob:.2f})")
+                elif c in cardiac_ics:  # QRS-locked residual BCG
+                    is_rej = True
+                    print(f"    [QRS-LOCKED] IC {c:02d}: Residual BCG (evoked-energy ratio={qrs_ratio[c]:.3f}, P_brain={brain_prob:.2f})")
+                elif dominant in (4, 5) and max_prob >= thresh_line_chan and brain_prob < min(max_brain_prob, 0.15):  # Line or Channel noise
+                    is_rej = True
+                elif dominant == 1 and max_prob >= thresh_muscle and brain_prob < min(max_brain_prob, 0.10):  # High-confidence Muscle
+                    is_rej = True
+                elif dominant == 6 and max_prob >= thresh_other and brain_prob < other_brain_max:  # Non-brain Other/Scanner/Pump noise
+                    is_rej = True
+                    print(f"    [OTHER/SCANNER] IC {c:02d}: Dominant Other noise (prob={max_prob:.2f}, P_brain={brain_prob:.2f})")
+
+                if is_rej:
+                    conf_score = max_prob - brain_prob + 0.5 * ecg_corrs[c] + (1.0 + qrs_ratio[c] if c in cardiac_ics else 0.0)
+                    candidate_rejects.append((c, conf_score))
+
+        # Manual IC exclusion support (from config or expert review)
+        if isinstance(manual_reject_ics, (list, tuple)):
+            for ic_item in manual_reject_ics:
+                try:
+                    ic_int = int(ic_item)
+                    idx = ic_int if ic_int < n_pca else ic_int - 1
+                    if 0 <= idx < n_pca:
+                        if not any(c == idx for c, _ in candidate_rejects):
+                            print(f"    [MANUAL] IC {idx:02d}: Manually marked for rejection")
+                            candidate_rejects.append((idx, 999.0))
+                except Exception:
+                    pass
 
         # Over-cleaning guard: cap rejection at max_rej_fraction of components (at least 5 to allow eye + ECG residuals)
         max_allowed = max(5, int(max_rej_fraction * n_pca))
@@ -711,6 +799,7 @@ exit(0);
             "burst_crit": burst_crit if str(burst_crit).lower() == "off" else float(burst_crit),
             "other_brain_max": float(OTHER_BRAIN_MAX),
             "ica_pca_max": int(ICA_PCA_MAX) if ICA_PCA_MAX else None,
+            "rejection_mode": rejection_mode,
         },
     }
 
