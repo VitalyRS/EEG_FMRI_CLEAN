@@ -529,8 +529,17 @@ try, java.lang.System.exit(0); catch, exit(0); end
                             print(f"    [QRS-LOCKED] IC {c:02d}: Residual BCG (evoked-energy ratio={qrs_ratio[c]:.3f}, P_brain={brain_prob:.2f})")
 
                         if is_rej:
-                            candidate_rejects.append((c, prob_artifact))
-                            print(f"    [META-MODEL] IC {c:02d}: P(artifact)={prob_artifact:.3f} (Class={classes_names[dominant]} {max_prob:.2f}, Brain={brain_prob:.2f})")
+                            # Priority score for the over-cleaning cap. QRS-locked /
+                            # ECG-correlated residual BCG must outrank generic noise:
+                            # the meta-model's P(artifact) for a cardiac IC is low
+                            # (it looks brain-ish to ICLabel), so scoring by it alone
+                            # let known BCG components get capped out while 'Other'
+                            # ICs survived. Add the same cardiac/ECG boost the
+                            # thresholds branch uses so BCG residuals always rank top.
+                            conf_score = prob_artifact + 0.5 * ecg_corrs[c] + (1.0 + qrs_ratio[c] if c in cardiac_ics else 0.0)
+                            candidate_rejects.append((c, conf_score))
+                            tag = " [QRS/ECG-PRIORITY]" if (c in cardiac_ics or ecg_corrs[c] >= r_ecg_thresh) else ""
+                            print(f"    [META-MODEL] IC {c:02d}: P(artifact)={prob_artifact:.3f} score={conf_score:.3f}{tag} (Class={classes_names[dominant]} {max_prob:.2f}, Brain={brain_prob:.2f})")
                 except Exception as e:
                     print(f"  [WARN] Failed loading meta-model ({e}); falling back to universal thresholds")
                     rejection_mode = "thresholds"

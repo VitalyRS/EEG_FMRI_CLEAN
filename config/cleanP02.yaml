@@ -111,7 +111,7 @@ ica_final:
   #   "thresholds" - универсальные пороги классов ICLabel (подобраны через Optuna)
   #   "meta_model" - обученный регулярный мета-классификатор (config/ica_meta_model.json)
   # rejection_mode: "thresholds"
-  rejection_mode: "meta_model"
+  rejection_mode:  "thresholds"
   # Принудительно перекрыть отдельные параметры поверх step10:
   force_params:
     burst_crit: 20.0
