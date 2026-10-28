@@ -57,6 +57,20 @@ FILTER_NOTCH = 50.0           # Hz - Notch filter for 50 Hz powerline interferen
 NPC_GRID     = [1, 2, 3, 4, 5, 6, 7, 8]   # OBS basis components to sweep (incl. gentle 1-2)
 FMRIB_DIR    = EEGLAB_DIR / "plugins" / "fMRIb2.1"
 
+# Residual beat-wise AAS + OBS (applied AFTER fMRIB OBS, in Python).
+# The pulse-wave ballistocardiogram peaks ~250 ms after the R-peak and is only
+# partly removed by the fixed-rank fMRIB OBS, leaving a QRS-locked residual
+# (~8-10x the reference). A beat-wise Average Artifact Subtraction (Allen 1998;
+# template = average of neighbouring beats, time-normalised to the local RR)
+# removes the reproducible part, and a small OBS on the AAS residual removes the
+# beat-variable part. The residual-OBS npc is swept per subject and gated on
+# alpha so it never over-cleans the occipital rhythm.
+RESIDUAL_AAS          = True                # enable the residual AAS+OBS stage
+AAS_NEIGHBORS         = 11                  # beats averaged for the AAS template (K)
+RESIDUAL_OBS_NPC_GRID = [0, 2, 3, 4, 5]     # residual-OBS components to sweep (0 = AAS only)
+RESIDUAL_ALPHA_GATE   = 0.85                # min occipital-alpha retention of the residual stage
+RESIDUAL_EVOKED_WIN   = (-0.1, 0.6)         # s, QRS-locked window for the residual OBS / scoring
+
 # Edge trimming (removes Bergen AAS & decimation filter boundary bursts)
 TRIM_ENABLED   = True
 TRIM_START_SEC = 1.0          # seconds to crop from beginning
@@ -669,6 +683,123 @@ def _apply_trim(raw: mne.io.BaseRaw) -> mne.io.BaseRaw:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Residual beat-wise AAS + OBS (pure Python, after the fMRIB OBS)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _qrs_evoked_rms(eeg: np.ndarray, qrs: np.ndarray, a: int, b: int) -> float:
+    """RMS of the QRS-locked average (the reproducible residual BCG waveform)."""
+    ep = [eeg[:, i + a:i + b] for i in qrs if i + a >= 0 and i + b < eeg.shape[1]]
+    if len(ep) < 20:
+        return 0.0
+    ep = np.stack(ep)
+    ep = ep - ep.mean(axis=2, keepdims=True)
+    return float(np.sqrt(np.mean(ep.mean(0) ** 2)))
+
+
+def _occ_alpha(eeg: np.ndarray, eeg_names: list[str], sfreq: float) -> float:
+    occ = [i for i, c in enumerate(eeg_names) if c in ("O1", "Oz", "O2", "POz", "Pz", "P3", "P4")]
+    if not occ:
+        occ = list(range(len(eeg_names)))
+    f, P = welch(eeg[occ], sfreq, nperseg=int(min(4 * sfreq, eeg.shape[1])), axis=-1)
+    return float(P[:, (f >= 8) & (f < 13)].mean())
+
+
+def _beatwise_aas(eeg: np.ndarray, qrs: np.ndarray, sfreq: float, K: int) -> np.ndarray:
+    """Allen-style AAS: subtract, per beat, the average of the K neighbouring
+    beats' epochs, time-normalised to the current beat's RR length (so RR
+    variability does not smear the template)."""
+    out = eeg.copy()
+    nq = len(qrs)
+    max_len = int(1.5 * sfreq)
+    for i in range(nq - 1):
+        s, e = int(qrs[i]), int(qrs[i + 1])
+        L = e - s
+        if L < 10 or L > max_len:
+            continue
+        lo, hi = max(0, i - K // 2), min(nq - 1, i + K // 2 + 1)
+        xn = np.linspace(0, 1, L)
+        temps = []
+        for j in range(lo, hi):
+            if j == i:
+                continue
+            sj, ej = int(qrs[j]), int(qrs[j + 1])
+            Lj = ej - sj
+            if Lj < 10 or Lj > max_len:
+                continue
+            seg = eeg[:, sj:ej]
+            xp = np.linspace(0, 1, Lj)
+            temps.append(np.stack([np.interp(xn, xp, seg[c]) for c in range(seg.shape[0])]))
+        if len(temps) >= 5:
+            out[:, s:e] -= np.mean(temps, axis=0)
+    return out
+
+
+def _residual_obs(eeg: np.ndarray, qrs: np.ndarray, a: int, b: int, npc: int) -> np.ndarray:
+    """Remove, per channel, the mean + top-`npc` PCs of the QRS-locked epoch
+    matrix (Optimal Basis Set on the AAS residual -> catches the beat-variable
+    part that averaging leaves behind)."""
+    if npc <= 0:
+        return eeg
+    out = eeg.copy()
+    idx = [int(i) for i in qrs if i + a >= 0 and i + b < eeg.shape[1]]
+    if len(idx) < 20:
+        return out
+    for c in range(eeg.shape[0]):
+        M = np.stack([eeg[c, i + a:i + b] for i in idx])     # beats x W
+        mu = M.mean(0)
+        Mc = M - mu
+        _, _, Vt = np.linalg.svd(Mc, full_matrices=False)
+        basis = Vt[:npc]
+        proj = Mc @ basis.T @ basis
+        for bi, i in enumerate(idx):
+            out[c, i + a:i + b] -= (mu + proj[bi])
+    return out
+
+
+def apply_residual_aas(after_eeg: np.ndarray, r_peaks, sfreq: float,
+                       eeg_names: list[str]) -> tuple[np.ndarray, dict]:
+    """Beat-wise AAS + swept residual-OBS applied to the fMRIB-OBS output.
+    Returns (cleaned_eeg, info). The residual-OBS npc is chosen per subject:
+    strongest QRS-locked residual suppression among the npc that keep the
+    occipital-alpha retention of this stage >= RESIDUAL_ALPHA_GATE."""
+    info = {"applied": False}
+    qrs = np.sort(np.unique(np.asarray(r_peaks, dtype=int)))
+    if not RESIDUAL_AAS or len(qrs) < 30:
+        return after_eeg, info
+    a = int(RESIDUAL_EVOKED_WIN[0] * sfreq)
+    b = int(RESIDUAL_EVOKED_WIN[1] * sfreq)
+    ev0 = _qrs_evoked_rms(after_eeg, qrs, a, b)
+    al0 = _occ_alpha(after_eeg, eeg_names, sfreq)
+
+    aas = _beatwise_aas(after_eeg, qrs, sfreq, int(AAS_NEIGHBORS))
+    grid = sorted(set(int(n) for n in RESIDUAL_OBS_NPC_GRID))
+    sweep = {}
+    for npc in grid:
+        cand = _residual_obs(aas, qrs, a, b, npc) if npc > 0 else aas
+        ev = _qrs_evoked_rms(cand, qrs, a, b)
+        al = _occ_alpha(cand, eeg_names, sfreq)
+        sweep[npc] = {"evoked_rms": ev,
+                      "cardiac_suppr": (1 - ev / ev0) if ev0 else 0.0,
+                      "alpha_ret": (al / al0) if al0 else 1.0}
+        print(f"    [RES-AAS] npc={npc}: QRS-residual={ev:.3f}uV "
+              f"(suppr {sweep[npc]['cardiac_suppr']*100:.0f}%)  alpha_ret={sweep[npc]['alpha_ret']*100:.0f}%")
+
+    eligible = [n for n in grid if sweep[n]["alpha_ret"] >= RESIDUAL_ALPHA_GATE]
+    best = max(eligible, key=lambda n: sweep[n]["cardiac_suppr"]) if eligible else 0
+    cleaned = _residual_obs(aas, qrs, a, b, best) if best > 0 else aas
+    info = {"applied": True, "aas_neighbors": int(AAS_NEIGHBORS), "residual_obs_npc": int(best),
+            "evoked_rms_before": ev0, "evoked_rms_after": sweep[best]["evoked_rms"],
+            "residual_cardiac_suppr": sweep[best]["cardiac_suppr"],
+            "residual_alpha_ret": sweep[best]["alpha_ret"],
+            "alpha_gate": RESIDUAL_ALPHA_GATE, "sweep": sweep}
+    print(f"  [RES-AAS] selected residual-OBS npc={best}: QRS-residual "
+          f"{ev0:.3f} -> {sweep[best]['evoked_rms']:.3f}uV "
+          f"(suppr {sweep[best]['cardiac_suppr']*100:.0f}%), "
+          f"alpha_ret={sweep[best]['alpha_ret']*100:.0f}%")
+    return cleaned, info
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main orchestration
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -820,6 +951,13 @@ def run_bcg_pipeline(segment_dir: Path = DEFAULT_SEGMENT_DIR, npc_grid=None, for
     # 5. Load winning cleaned data, compute full + per-channel metrics
     clean_all = np.array(sio.loadmat(cleaned_paths[best_npc])["clean"], dtype=np.float64)
     after_eeg = clean_all[eeg_mask]
+
+    # 5b. Residual beat-wise AAS + swept OBS on the fMRIB-OBS output (Python).
+    # Removes the ~250 ms pulse-wave BCG that the fixed-rank OBS leaves behind.
+    after_eeg, res_aas_info = apply_residual_aas(after_eeg, r_peaks, sfreq, eeg_names)
+    if res_aas_info.get("applied"):
+        clean_all[eeg_mask] = after_eeg          # feed the cleaned EEG into metrics + saved output
+
     metrics = compute_bcg_metrics(before_eeg, after_eeg, ecg, sfreq, eeg_names, eval_chs)
     per_channel = {c: compute_bcg_metrics(before_eeg, after_eeg, ecg, sfreq, eeg_names, [c])
                    for c in eval_chs}
@@ -841,7 +979,8 @@ def run_bcg_pipeline(segment_dir: Path = DEFAULT_SEGMENT_DIR, npc_grid=None, for
     # 7. Metrics JSON + HTML report
     metrics_out = {**metrics, "best_npc": int(best_npc), "alpha_flag": alpha_flag,
                    "alpha_warn_min": ALPHA_WARN_MIN, "n_rpeaks": int(len(r_peaks)),
-                   "sfreq": sfreq, "npc_sweep": {int(k): v for k, v in sweep.items()}}
+                   "sfreq": sfreq, "npc_sweep": {int(k): v for k, v in sweep.items()},
+                   "residual_aas": res_aas_info}
     (bcg_dir / f"{seg_name}_bcg_metrics.json").write_text(
         json.dumps(metrics_out, indent=2), encoding="utf-8")
     out_html = bcg_dir / f"{seg_name}_bcg_report.html"
