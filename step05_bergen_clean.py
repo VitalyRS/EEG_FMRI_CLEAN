@@ -24,7 +24,17 @@ def clean_full_dataset(segment_dir: Path = DEFAULT_SEGMENT_DIR,
                        shift: int = None,
                        win_k: int = None,
                        motion_thresh: float = None,
+                       pad_volumes: int = 3,
                        force: bool = False):
+    """
+    pad_volumes: give Bergen AAS extra whole fMRI volumes on each side of the
+        work window (taken from the dummy-scan / post-task gradient that already
+        exists in the continuous recording) so the moving-average template at the
+        first/last real volume has neighbours. The padding is trimmed back off
+        after correction, so the output length is unchanged. 0 = old behaviour
+        (tight crop, edge residual). Padding is clamped to what the recording
+        actually provides on each side.
+    """
     segment_dir = Path(segment_dir).resolve()
     print("=" * 70)
     print(f"[STEP 05] Full Dataset Bergen Cleaning for: {segment_dir.name}")
@@ -74,14 +84,96 @@ def clean_full_dataset(segment_dir: Path = DEFAULT_SEGMENT_DIR,
     print(f"  Applying Winner Parameters: shift={shift:+d} | win_k={win_k} | motion_thresh={motion_thresh:.2f}")
 
     # Extract cropped segment in Python via memory-mapped lazy reading (avoids EEGLAB 11GB pop_loadbv spike)
-    print(f"  Loading cropped segment interval [{t_start:.2f}s .. {t_stop:.2f}s] with MNE...")
     raw = mne.io.read_raw_brainvision(raw_vhdr, preload=False, verbose=False)
     sfreq = float(raw.info["sfreq"])
-    raw_crop = raw.crop(tmin=t_start, tmax=min(raw.times[-1], t_stop))
+    rec_end = float(raw.times[-1])
+    nominal_volume_samples = slices_per_volume * nominal_slice_samples
+
+    # ----- Edge padding for Bergen AAS -----------------------------------------
+    # The AAS template for a volume is a moving average of neighbouring volumes'
+    # slice-locked epochs. At the first/last work volume there are no neighbours
+    # on one side -> poor subtraction -> a large residual gradient transient that
+    # survives into P02 (seen as a huge spike in the first ~1 s / last ~3 s).
+    # Fix: extend the crop by whole fMRI volumes of real gradient that already
+    # exist in the continuous recording (dummy scans before the task, post-task
+    # volumes after it), run Bergen on the padded window, then trim the pad back
+    # off so the output window is exactly the original [t_start .. t_stop].
+    t0_smp = int(round(t_start * sfreq))
+    t1_smp = int(round(t_stop * sfreq))              # exclusive stop (t_work_stop)
+    orig_length = t1_smp - t0_smp
+
+    # Gradient-presence gate: a pad side is only useful if it actually contains
+    # the MR gradient (so Bergen has real neighbouring volumes to average). Dummy
+    # scans before the task are gradient-ON; but with per-task fMRI runs the
+    # scanner stops after the last volume, so the region after t_stop is gradient
+    # -OFF and padding there would corrupt the last volume's template. We compare
+    # each candidate pad region's RMS to the task RMS and skip a side without it.
+    _picks = [i for i, c in enumerate(raw.ch_names) if c != "ECG"][:8]
+    def _rms(a_smp, b_smp):
+        a = max(0, a_smp); b = min(raw.n_times, b_smp)
+        if b - a < int(0.5 * sfreq):
+            return 0.0
+        d = raw.get_data(picks=_picks, start=a, stop=b) * 1e6
+        return float(np.sqrt(np.mean(d ** 2)))
+    task_rms = _rms(t0_smp, t0_smp + nominal_volume_samples)   # first work volume
+    GRAD_FRAC = 0.5                                            # pad must have >=50% of task RMS
+
+    left_pad_vols = right_pad_vols = 0
+    if pad_volumes and pad_volumes > 0:
+        cand_left = min(pad_volumes, t0_smp // nominal_volume_samples)
+        if cand_left and _rms(t0_smp - cand_left * nominal_volume_samples, t0_smp) >= GRAD_FRAC * task_rms:
+            left_pad_vols = cand_left
+        elif cand_left:
+            print(f"  [PAD] left pad skipped: no gradient before t_start "
+                  f"(RMS {_rms(t0_smp - cand_left*nominal_volume_samples, t0_smp):.0f} < {GRAD_FRAC}*{task_rms:.0f})")
+        rec_end_smp = int(round(rec_end * sfreq)) + 1
+        cand_right = min(pad_volumes, max(0, (rec_end_smp - t1_smp) // nominal_volume_samples))
+        if cand_right and _rms(t1_smp, t1_smp + cand_right * nominal_volume_samples) >= GRAD_FRAC * task_rms:
+            right_pad_vols = cand_right
+        elif cand_right:
+            print(f"  [PAD] right pad skipped: no gradient after t_stop "
+                  f"(RMS {_rms(t1_smp, t1_smp + cand_right*nominal_volume_samples):.0f} < {GRAD_FRAC}*{task_rms:.0f})")
+    left_pad = left_pad_vols * nominal_volume_samples
+    right_pad = right_pad_vols * nominal_volume_samples
+
+    new_tmin = (t0_smp - left_pad) / sfreq
+    new_tmax = min(rec_end, (t1_smp + right_pad) / sfreq)
+    if left_pad or right_pad:
+        print(f"  Bergen edge-padding: +{left_pad_vols} vol left, +{right_pad_vols} vol right "
+              f"({left_pad/sfreq:.1f}s / {right_pad/sfreq:.1f}s); trimmed back after correction")
+    print(f"  Loading padded segment interval [{new_tmin:.2f}s .. {new_tmax:.2f}s] with MNE "
+          f"(work window [{t_start:.2f} .. {t_stop:.2f}]) ...")
+    raw_crop = raw.crop(tmin=new_tmin, tmax=new_tmax)
     data_crop = raw_crop.get_data(units="uV").astype(np.float32)
     ch_names = list(raw_crop.ch_names)
     del raw, raw_crop
     gc.collect()
+
+    # Extended slice triggers (periodic, 1-based relative to the padded crop).
+    # Because the crop is extended by an integer number of volumes (=integer
+    # multiple of nominal_slice_samples) the slice grid stays phase-aligned, so
+    # the periodic triggers from sample 1 still land on real slice onsets.
+    orig_triggers = np.loadtxt(triggers_path).astype(int).ravel()
+    n_work_volumes = len(orig_triggers) // slices_per_volume
+    total_slices_padded = (left_pad_vols + n_work_volumes + right_pad_vols) * slices_per_volume
+    padded_triggers = np.array([1 + i * nominal_slice_samples for i in range(total_slices_padded)], dtype=int)
+    triggers_padded_path = segment_dir / "slice_triggers_padded.txt"
+    np.savetxt(triggers_padded_path, padded_triggers, fmt="%d")
+    triggers_path = triggers_padded_path
+
+    # Pad the SPM motion file by edge-replication (not zeros: a zero row would
+    # create a fake motion jump at the dummy/work boundary and down-weight the
+    # first real volume). The pad volumes thus inherit the nearest real motion.
+    if rp_path and rp_path.exists() and (left_pad_vols or right_pad_vols):
+        rp_data = np.loadtxt(rp_path)
+        if rp_data.ndim == 1:
+            rp_data = rp_data[None, :]
+        rp_padded = np.vstack(
+            [np.repeat(rp_data[:1], left_pad_vols, axis=0), rp_data,
+             np.repeat(rp_data[-1:], right_pad_vols, axis=0)])
+        rp_padded_path = segment_dir / "rp_padded.txt"
+        np.savetxt(rp_padded_path, rp_padded, fmt="%.10f")
+        rp_path = rp_padded_path
 
     temp_mat = segment_dir / "temp_multich_crop.mat"
     savemat(temp_mat, {
@@ -99,6 +191,15 @@ def clean_full_dataset(segment_dir: Path = DEFAULT_SEGMENT_DIR,
     m_script = segment_dir / "run_full_optuna_clean.m"
 
     helper_dir = Path(__file__).parent.resolve()
+
+    # Trim the padding back off (in MATLAB, keeping the EEGLAB .set intact) so the
+    # saved window is exactly the original [t_start .. t_stop]. 1-based inclusive.
+    trim_code = ""
+    if left_pad or right_pad:
+        trim_code = (f"fprintf('Trimming edge padding back to work window "
+                     f"({orig_length} pnts)...\\n');\n"
+                     f"EEG = pop_select(EEG, 'point', [{left_pad + 1} {left_pad + orig_length}]);\n"
+                     f"EEG = eeg_checkset(EEG);")
 
     rp_code = ""
     if rp_path and rp_path.exists():
@@ -180,7 +281,7 @@ onset_val  = 0;
 offset_val = onset_val + TR_sl - 1;
 EEG = bergen_fast_correction(EEG, W, Peak_slices, onset_val, offset_val);
 clear W;
-
+{trim_code}
 fprintf('Saving cleaned EEGLAB dataset: {out_name}...\\n');
 pop_saveset(EEG, 'filename', '{out_name}', 'filepath', '{out_set.parent.resolve()}', 'savemode', 'onefile');
 clear EEG;
@@ -197,6 +298,8 @@ exit(0);
     )
     m_script.unlink(missing_ok=True)
     temp_mat.unlink(missing_ok=True)
+    (segment_dir / "slice_triggers_padded.txt").unlink(missing_ok=True)
+    (segment_dir / "rp_padded.txt").unlink(missing_ok=True)
     print(res.stdout[-1000:] if res.stdout else "")
 
     if res.returncode == 0 and out_set.exists():
