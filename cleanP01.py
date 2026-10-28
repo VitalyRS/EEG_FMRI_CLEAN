@@ -256,9 +256,19 @@ def cleanup_heavy(seg_dir: Path) -> float:
 # Per-segment / per-subject drivers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def process_segment(seg_dir: Path, n_trials: int, force_resample: bool = False):
+def process_segment(seg_dir: Path, n_trials: int, force_resample: bool = False,
+                    force: bool = False):
     seg = seg_dir.name
     set_out, fif_out = _out_paths(seg_dir)
+
+    # --force: recompute from Bergen (step05) so a changed step05 (e.g. edge
+    # padding) is applied even when the 250 Hz output already exists. We drop the
+    # stale 250 Hz files so nothing downstream reuses them.
+    if force:
+        for p in (set_out, fif_out):
+            if p.exists():
+                p.unlink()
+        force_resample = True
 
     # If the 250 Hz result already exists and the 5000 Hz set was already deleted,
     # steps 05-07 must NOT re-run (they would recompute the heavy file).
@@ -276,7 +286,7 @@ def process_segment(seg_dir: Path, n_trials: int, force_resample: bool = False):
     else:
         run_optuna_tuning(seg_dir, n_trials=n_trials)
     _banner(f"[{seg}] step05 Bergen AAS (5000 Hz)", "-")
-    clean_full_dataset(seg_dir)
+    clean_full_dataset(seg_dir, force=force)
     _banner(f"[{seg}] step06 spectra", "-")
     compute_spectra(seg_dir)
     _banner(f"[{seg}] step07 HTML report", "-")
@@ -287,7 +297,8 @@ def process_segment(seg_dir: Path, n_trials: int, force_resample: bool = False):
 
 
 def process_subject(sid: str, vhdrs: dict[str, Path], n_trials: int,
-                    keep_heavy: bool, force_resample: bool) -> dict:
+                    keep_heavy: bool, force_resample: bool,
+                    segments_filter: list[str] | None = None, force: bool = False) -> dict:
     t0 = time.time()
     _banner(f"SUBJECT {sid}", "#")
     summary = {"subject": sid, "ok": [], "failed": [], "freed_mb": 0.0}
@@ -304,10 +315,12 @@ def process_subject(sid: str, vhdrs: dict[str, Path], n_trials: int,
         print("  [SKIP] step01: segment_info.json already present.")
 
     seg_dirs = _segment_dirs(sid)
+    if segments_filter:
+        seg_dirs = [d for d in seg_dirs if d.name in segments_filter]
     print(f"  Segments: {[d.name for d in seg_dirs]}")
     for seg_dir in seg_dirs:
         try:
-            process_segment(seg_dir, n_trials, force_resample)
+            process_segment(seg_dir, n_trials, force_resample, force=force)
             summary["ok"].append(seg_dir.name)
         except Exception as ex:
             summary["failed"].append((seg_dir.name, str(ex)))
@@ -338,16 +351,21 @@ def main():
     ap.add_argument("--trials", type=int, default=DEFAULT_N_TRIALS, help="Optuna Bergen trials per segment")
     ap.add_argument("--keep-heavy", action="store_true", help="Do NOT delete 5000 Hz intermediates")
     ap.add_argument("--force-resample", action="store_true", help="Recompute the 250 Hz files")
+    ap.add_argument("--segments", nargs="+", default=None,
+                    help="Only process these segments (e.g. drone lasertag video)")
+    ap.add_argument("--force", action="store_true",
+                    help="Recompute from Bergen (step05) even if 250 Hz output exists (applies step05 changes)")
     args = ap.parse_args()
 
     vhdrs = discover_all_eeg_vhdrs()
     subjects = sorted(vhdrs) if args.all else args.subjects
-    print(f"[cleanP01] Subjects to process: {subjects}")
+    print(f"[cleanP01] Subjects to process: {subjects}  segments={args.segments or 'all'}  force={args.force}")
 
     results = []
     for sid in subjects:
         try:
-            results.append(process_subject(sid, vhdrs, args.trials, args.keep_heavy, args.force_resample))
+            results.append(process_subject(sid, vhdrs, args.trials, args.keep_heavy, args.force_resample,
+                                           segments_filter=args.segments, force=args.force))
         except Exception as ex:
             traceback.print_exc()
             results.append({"subject": sid, "ok": [], "failed": [("subject", str(ex))], "freed_mb": 0.0})

@@ -422,7 +422,10 @@ class AutoAlignWorker(QThread):
 
             t_base = np.arange(s0_1, s1_1) / sf1
 
-            lags_ms = np.arange(-1000.0, 1005.0, 5.0)
+            # Окно поиска сдвига ±2500 мс: разная обрезка краёв (паддинг Бергена,
+            # trim, dummy-объёмы fMRI) даёт сдвиг до ~1.1 с — прежние ±1000 мс
+            # упирались в край и не находили максимум.
+            lags_ms = np.arange(-2500.0, 2505.0, 5.0)
             total_lags = len(lags_ms)
 
             best_lag_ms = 0.0
