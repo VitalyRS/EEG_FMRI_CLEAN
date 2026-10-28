@@ -57,6 +57,11 @@ FILTER_NOTCH = 50.0           # Hz - Notch filter for 50 Hz powerline interferen
 NPC_GRID     = [1, 2, 3, 4, 5, 6, 7, 8]   # OBS basis components to sweep (incl. gentle 1-2)
 FMRIB_DIR    = EEGLAB_DIR / "plugins" / "fMRIb2.1"
 
+# Edge trimming (removes Bergen AAS & decimation filter boundary bursts)
+TRIM_ENABLED   = True
+TRIM_START_SEC = 1.0          # seconds to crop from beginning
+TRIM_END_SEC   = 1.0          # seconds to crop from end
+
 # npc SELECTION POLICY (OBS -> ICA architecture):
 ALPHA_WARN_MIN = 0.60   # below this, flag REVIEW for a human/QC glance
 ALPHA_GATE_MIN = BCG_ALPHA_GATE_MIN
@@ -647,6 +652,22 @@ def generate_bcg_html(seg_name, metrics, best_npc, per_channel, sfreq_before,
     out_html.write_text(html, encoding="utf-8")
 
 
+def _apply_trim(raw: mne.io.BaseRaw) -> mne.io.BaseRaw:
+    if not TRIM_ENABLED:
+        return raw
+    t_start = max(0.0, float(TRIM_START_SEC))
+    t_end = max(0.0, float(TRIM_END_SEC))
+    if t_start <= 0.0 and t_end <= 0.0:
+        return raw
+    t_max = float(raw.times[-1]) - t_end
+    if t_max <= t_start + 1.0:
+        print(f"  [WARN] Data duration ({raw.times[-1]:.2f}s) too short to trim {t_start:.1f}s start + {t_end:.1f}s end. Skipping crop.")
+        return raw
+    print(f"  [TRIM] Cropping edge artifacts: t=[{t_start:.2f}s .. {t_max:.2f}s] (cut {t_start:.2f}s start, {t_end:.2f}s end)")
+    raw.crop(tmin=t_start, tmax=t_max)
+    return raw
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main orchestration
 # ─────────────────────────────────────────────────────────────────────────────
@@ -690,9 +711,19 @@ def run_bcg_pipeline(segment_dir: Path = DEFAULT_SEGMENT_DIR, npc_grid=None, for
     if resamp_fif.exists() and not force:
         print(f"  Found pre-existing resampled 250 Hz data: {resamp_fif.name}, loading directly...")
         raw_rs = mne.io.read_raw_fif(resamp_fif, preload=True, verbose=False)
+        # Check if pre-existing file was never trimmed and trimming is enabled
+        if TRIM_ENABLED and (TRIM_START_SEC > 0 or TRIM_END_SEC > 0) and bergen_fif.exists():
+            raw_bg = mne.io.read_raw_fif(bergen_fif, preload=False, verbose=False)
+            if abs(raw_rs.n_times - raw_bg.n_times) <= 2:
+                print(f"  Pre-existing {resamp_fif.name} is uncropped ({raw_rs.times[-1]:.1f}s). Rebuilding with edge trim from {bergen_fif.name}...")
+                raw_rs = mne.io.read_raw_fif(bergen_fif, preload=True, verbose=False)
+                raw_rs = _apply_trim(raw_rs)
+                raw_rs = bandpass_raw(raw_rs, FILTER_HP, FILTER_LP)
+                raw_rs.save(resamp_fif, overwrite=True, verbose=False)
     elif bergen_fif.exists():
         print(f"  Found 250 Hz Bergen data: {bergen_fif.name}, loading...")
         raw_rs = mne.io.read_raw_fif(bergen_fif, preload=True, verbose=False)
+        raw_rs = _apply_trim(raw_rs)
         raw_rs = bandpass_raw(raw_rs, FILTER_HP, FILTER_LP)
         raw_rs.save(resamp_fif, overwrite=True, verbose=False)
         print(f"  Saved resampled+filtered: {resamp_fif}")
@@ -702,6 +733,7 @@ def run_bcg_pipeline(segment_dir: Path = DEFAULT_SEGMENT_DIR, npc_grid=None, for
         raw = _load_set_as_raw(set_path)
         raw_rs = resample_raw(raw, TARGET_SFREQ)
         del raw; gc.collect()
+        raw_rs = _apply_trim(raw_rs)
         raw_rs = bandpass_raw(raw_rs, FILTER_HP, FILTER_LP)
         raw_rs.save(resamp_fif, overwrite=True, verbose=False)
         print(f"  Saved resampled+filtered: {resamp_fif}")
@@ -712,6 +744,7 @@ def run_bcg_pipeline(segment_dir: Path = DEFAULT_SEGMENT_DIR, npc_grid=None, for
         raw = _load_set_as_raw(set_path)
         raw_rs = resample_raw(raw, TARGET_SFREQ)
         del raw; gc.collect()
+        raw_rs = _apply_trim(raw_rs)
         raw_rs = bandpass_raw(raw_rs, FILTER_HP, FILTER_LP)
         raw_rs.save(resamp_fif, overwrite=True, verbose=False)
         print(f"  Saved resampled+filtered: {resamp_fif}")

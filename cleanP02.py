@@ -110,6 +110,9 @@ PARAM_MAP: dict[tuple, list] = {
     ("filter", "hp"): [(s08, "FILTER_HP", float)],
     ("filter", "lp"): [(s08, "FILTER_LP", float)],
     ("filter", "notch"): [(s08, "FILTER_NOTCH", lambda v: float(v) if (v and str(v).lower() != "off") else None)],
+    ("trim", "enabled"): [(s08, "TRIM_ENABLED", bool)],
+    ("trim", "start_sec"): [(s08, "TRIM_START_SEC", float)],
+    ("trim", "end_sec"): [(s08, "TRIM_END_SEC", float)],
     ("bcg", "npc_grid"): [(s08, "NPC_GRID", _ints)],
     ("bcg", "alpha_gate_min"): [(s08, "ALPHA_GATE_MIN", float)],
     ("bcg", "min_cardiac_suppr"): [(s08, "MIN_CARDIAC_SUPPR", float)],
@@ -163,7 +166,7 @@ DICT_LEAVES = {("ica_final", "force_params"), ("overrides",)}
 
 # Config sections each step depends on (hashed for rerun_on_config_change).
 STEP_SECTIONS = {
-    "bcg": ["bands", "filter", "bcg"],
+    "bcg": ["bands", "filter", "trim", "bcg"],
     "ica_opt": ["bands", "ica_opt", "iclabel"],
     "ica_final": ["bands", "iclabel", "ica_final"],
 }

@@ -235,6 +235,9 @@ python analysis_dima/qrs_agreement.py --sid 1916 1917 --seg drone lasertag
 
 # 5. Тестовый перенос очистки BCG из эталона:
 python analysis_dima/bcg_transplant.py --sid 1916 --seg drone
+
+# 6. Перебор рангов ICA и стратегий отбраковки для максимизации сходства с эталоном Димы:
+python analysis_dima/sweep_ica_params.py --sid 1916 1925 --seg drone --pca 75 80 85 90 95
 ```
 
 ---
@@ -263,6 +266,12 @@ filter:
   hp: 1.0        # High-pass (Гц)
   lp: 80.0       # Low-pass (Гц, расширенная полоса до 80 Гц)
   notch: 50.0    # Notch-фильтр 50 Гц (полоса 49-51 Гц)
+
+# Обрезка краев (удаление краевых всплесков Bergen AAS и фильтрации)
+trim:
+  enabled: true
+  start_sec: 1.0 # Отрезать секунд с начала (устраняет краевой скачок до 16-20 мВ)
+  end_sec: 1.0   # Отрезать секунд с конца
 
 # Баллистокардиограмма fMRIB OBS
 bcg:
