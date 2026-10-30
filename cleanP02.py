@@ -454,7 +454,11 @@ def collect_row(sp: SegPaths, cfg: dict) -> dict:
     row = {
         "subject": sp.sid, "segment": sp.seg,
         "bcg_npc": b.get("best_npc"), "bcg_cardiac_suppr": b.get("cardiac_suppression"),
-        "bcg_alpha_ret": b.get("alpha_retention"), "bcg_alpha_flag": b.get("alpha_flag"),
+        # brain-alpha (QRS-locked component removed) if available, else raw — the raw
+        # ratio counts BCG pseudo-alpha removal as loss and false-flags low-alpha subjects
+        "bcg_alpha_ret": (b.get("alpha_retention_brain") if b.get("alpha_retention_brain") is not None
+                          else b.get("alpha_retention")),
+        "bcg_alpha_raw": b.get("alpha_retention"), "bcg_alpha_flag": b.get("alpha_flag"),
         "n_rpeaks": b.get("n_rpeaks"),
         **{f"ica_{k}": pu.get(k) for k in ICA_PARAM_KEYS},
         "n_ch_removed": m.get("n_channels_removed"),

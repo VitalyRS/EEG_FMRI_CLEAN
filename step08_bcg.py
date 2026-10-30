@@ -466,9 +466,30 @@ def _bandpower(f, psd, lo, hi):
     return float(np.trapz(psd[m], f[m])) if np.any(m) else 0.0
 
 
+def _subtract_qrs_locked(x: np.ndarray, qrs, a: int, b: int) -> np.ndarray:
+    """Return x with its QRS-locked average removed (the cardiac/BCG component,
+    which smears pseudo-alpha into 8-13 Hz). What remains is the 'brain' signal:
+    anything NOT phase-locked to the heartbeat. a,b = epoch bounds in samples."""
+    spans = [(int(q) + a, int(q) + b) for q in qrs if int(q) + a >= 0 and int(q) + b <= len(x)]
+    if len(spans) < 20:
+        return x
+    ev = np.mean([x[s:e] for s, e in spans], axis=0)
+    y = x.copy()
+    for s, e in spans:
+        y[s:e] -= ev
+    return y
+
+
 def compute_bcg_metrics(before: np.ndarray, after: np.ndarray, ecg: np.ndarray,
-                        sfreq: float, ch_names: list[str], eval_chs: list[str]) -> dict:
-    """before/after: EEG-only arrays with the SAME channel order as ch_names."""
+                        sfreq: float, ch_names: list[str], eval_chs: list[str],
+                        qrs=None) -> dict:
+    """before/after: EEG-only arrays with the SAME channel order as ch_names.
+
+    If `qrs` (R-peak sample indices) is given, additionally computes
+    `alpha_retention_brain`: alpha retention measured AFTER subtracting the
+    QRS-locked average from both before and after. This excludes BCG pseudo-alpha
+    from the ratio, so cleaning the cardiac artifact out of the alpha band is no
+    longer mis-counted as brain-alpha loss (the raw `alpha_retention` does that)."""
     nperseg = int(min(4 * sfreq, before.shape[1]))
     idx = [ch_names.index(c) for c in eval_chs if c in ch_names]
 
@@ -483,6 +504,19 @@ def compute_bcg_metrics(before: np.ndarray, after: np.ndarray, ecg: np.ndarray,
 
     cardiac_suppression = float(np.clip(1.0 - card_a / max(card_b, 1e-20), 0.0, 1.0))
     alpha_retention = float(np.clip(alpha_a / max(alpha_b, 1e-20), 0.0, 1.5))
+
+    alpha_retention_brain = None
+    if qrs is not None and len(qrs) >= 20:
+        a0, b0 = int(-0.1 * sfreq), int(0.6 * sfreq)
+        br_b = br_a = 0.0
+        for i in idx:
+            xb = _subtract_qrs_locked(before[i], qrs, a0, b0)
+            xa = _subtract_qrs_locked(after[i],  qrs, a0, b0)
+            fb, pbb = welch(xb, sfreq, nperseg=nperseg)
+            _,  paa = welch(xa, sfreq, nperseg=nperseg)
+            br_b += _bandpower(fb, pbb, *ALPHA_BAND)
+            br_a += _bandpower(fb, paa, *ALPHA_BAND)
+        alpha_retention_brain = float(np.clip(br_a / max(br_b, 1e-20), 0.0, 1.5))
 
     def mean_abs_corr(dat):
         cs = []
@@ -504,6 +538,7 @@ def compute_bcg_metrics(before: np.ndarray, after: np.ndarray, ecg: np.ndarray,
     return {
         "cardiac_suppression": cardiac_suppression,
         "alpha_retention": alpha_retention,
+        "alpha_retention_brain": alpha_retention_brain,
         "ecg_corr_before": corr_before,
         "ecg_corr_after": corr_after,
         "corr_drop": corr_drop,
@@ -939,13 +974,11 @@ def run_bcg_pipeline(segment_dir: Path = DEFAULT_SEGMENT_DIR, npc_grid=None, for
             print(f"  [NOTE] Fallback to composite BSI selection: picked npc={best_npc} "
                   f"(BSI={sweep[best_npc]['bsi']:.4f}, cardiac={sweep[best_npc]['cardiac_suppression']*100:.1f}%, "
                   f"alpha={sweep[best_npc]['alpha_retention']*100:.1f}%).")
-    alpha_flag = "OK" if sweep[best_npc]["alpha_retention"] >= ALPHA_WARN_MIN else "REVIEW"
-    if alpha_flag == "REVIEW":
-        print(f"  [NOTE] alpha retention {sweep[best_npc]['alpha_retention']*100:.1f}% "
-              f"< {ALPHA_WARN_MIN*100:.0f}% -> flagged REVIEW (residual/alpha split left to ICA).")
+    # NB: alpha_flag is set below from brain-alpha (QRS-locked removed), not from
+    # this raw sweep value. Raw alpha is printed here only as a sweep diagnostic.
     print(f"  Selected npc = {best_npc} "
           f"(cardiac={sweep[best_npc]['cardiac_suppression']*100:.1f}%, "
-          f"alpha={sweep[best_npc]['alpha_retention']*100:.1f}%, flag={alpha_flag})")
+          f"alpha_raw={sweep[best_npc]['alpha_retention']*100:.1f}%)")
     plot_npc_sweep(sweep, best_npc, qc_dir / f"{seg_name}_npc_sweep.png")
 
     # 5. Load winning cleaned data, compute full + per-channel metrics
@@ -958,11 +991,20 @@ def run_bcg_pipeline(segment_dir: Path = DEFAULT_SEGMENT_DIR, npc_grid=None, for
     if res_aas_info.get("applied"):
         clean_all[eeg_mask] = after_eeg          # feed the cleaned EEG into metrics + saved output
 
-    metrics = compute_bcg_metrics(before_eeg, after_eeg, ecg, sfreq, eeg_names, eval_chs)
+    metrics = compute_bcg_metrics(before_eeg, after_eeg, ecg, sfreq, eeg_names, eval_chs,
+                                  qrs=r_peaks)
     per_channel = {c: compute_bcg_metrics(before_eeg, after_eeg, ecg, sfreq, eeg_names, [c])
                    for c in eval_chs}
+    # Re-base the alpha flag on brain-alpha (QRS-locked component removed): the raw
+    # alpha_retention counts removal of BCG pseudo-alpha as "loss" and false-flags
+    # open-eye / low-alpha subjects (verified: 1921 raw 0.34 but absolute occipital
+    # alpha is mid-cohort). Falls back to raw alpha_retention if QRS was unusable.
+    ar_brain = metrics.get("alpha_retention_brain")
+    ar_for_flag = ar_brain if ar_brain is not None else sweep[best_npc]["alpha_retention"]
+    alpha_flag = "OK" if ar_for_flag >= ALPHA_WARN_MIN else "REVIEW"
     print(f"  FINAL BSI={metrics['bsi']:.3f} | cardiac={metrics['cardiac_suppression']*100:.1f}% "
-          f"| alpha={metrics['alpha_retention']*100:.1f}% "
+          f"| alpha_raw={metrics['alpha_retention']*100:.1f}% "
+          f"| alpha_brain={(ar_brain*100 if ar_brain is not None else float('nan')):.1f}% (flag={alpha_flag}) "
           f"| corr {metrics['ecg_corr_before']:.3f}->{metrics['ecg_corr_after']:.3f}")
 
     plot_spectra(before_eeg, after_eeg, sfreq, eeg_names, eval_chs,
