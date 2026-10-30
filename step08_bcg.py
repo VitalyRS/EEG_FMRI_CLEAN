@@ -68,7 +68,9 @@ FMRIB_DIR    = EEGLAB_DIR / "plugins" / "fMRIb2.1"
 RESIDUAL_AAS          = True                # enable the residual AAS+OBS stage
 AAS_NEIGHBORS         = 11                  # beats averaged for the AAS template (K)
 RESIDUAL_OBS_NPC_GRID = [0, 2, 3, 4, 5]     # residual-OBS components to sweep (0 = AAS only)
-RESIDUAL_ALPHA_GATE   = 0.85                # min occipital-alpha retention of the residual stage
+RESIDUAL_ALPHA_GATE   = 0.85                # (legacy "absolute" gate) min occipital-alpha retention
+RESIDUAL_GATE_MODE    = "efficiency"        # "efficiency" (default) | "absolute"
+RESIDUAL_ALPHA_EFF_LAMBDA = 1.0             # efficiency gate: accept npc if cardiac_suppr >= LAMBDA*(1-alpha_ret)
 RESIDUAL_EVOKED_WIN   = (-0.1, 0.6)         # s, QRS-locked window for the residual OBS / scoring
 
 # Edge trimming (removes Bergen AAS & decimation filter boundary bursts)
@@ -795,8 +797,8 @@ def apply_residual_aas(after_eeg: np.ndarray, r_peaks, sfreq: float,
                        eeg_names: list[str]) -> tuple[np.ndarray, dict]:
     """Beat-wise AAS + swept residual-OBS applied to the fMRIB-OBS output.
     Returns (cleaned_eeg, info). The residual-OBS npc is chosen per subject:
-    strongest QRS-locked residual suppression among the npc that keep the
-    occipital-alpha retention of this stage >= RESIDUAL_ALPHA_GATE."""
+    the strongest QRS-locked residual suppressor among the admissible npc. See the
+    gate block below for how admissibility is decided (RESIDUAL_GATE_MODE)."""
     info = {"applied": False}
     qrs = np.sort(np.unique(np.asarray(r_peaks, dtype=int)))
     if not RESIDUAL_AAS or len(qrs) < 30:
@@ -819,14 +821,38 @@ def apply_residual_aas(after_eeg: np.ndarray, r_peaks, sfreq: float,
         print(f"    [RES-AAS] npc={npc}: QRS-residual={ev:.3f}uV "
               f"(suppr {sweep[npc]['cardiac_suppr']*100:.0f}%)  alpha_ret={sweep[npc]['alpha_ret']*100:.0f}%")
 
-    eligible = [n for n in grid if sweep[n]["alpha_ret"] >= RESIDUAL_ALPHA_GATE]
+    # Gate choosing which npc is admissible.
+    #
+    # "absolute" (legacy): keep npc only if it retains >= RESIDUAL_ALPHA_GATE of the
+    # stage's occipital alpha. This backfires on subjects whose fMRIB-OBS left a large
+    # BCG residual overlapping 8-13 Hz: residual-OBS removes that cardiac pseudo-alpha,
+    # the raw alpha ratio drops below the floor, and the whole stage is rejected
+    # (npc=0) -> 1.6-2.3 uV of BCG survives. Note the QRS-locked-average ("brain
+    # alpha") correction does NOT help here: the pseudo-alpha lives in the beat-
+    # VARIABLE part that averaging leaves in, so brain-alpha ~= raw alpha (verified).
+    #
+    # "efficiency" (default): residual-OBS only subtracts signal supported inside the
+    # QRS epochs and spanned by beat-to-beat covariation, so the alpha it removes is
+    # cardiac by construction. Accept an npc when its occipital-alpha loss is "paid
+    # for" by commensurate QRS-residual suppression (cardiac_suppr >= LAMBDA*(1-ret)).
+    # Genuine over-subtraction (alpha falling faster than cardiac is removed) still
+    # fails the test. Among the admissible npc the strongest suppressor is chosen, as
+    # before — and because residual suppression peaks at low npc and then declines,
+    # that argmax is self-limiting (it does not creep to high, brain-eating npc).
+    if str(RESIDUAL_GATE_MODE).lower() == "absolute":
+        eligible = [n for n in grid if sweep[n]["alpha_ret"] >= RESIDUAL_ALPHA_GATE]
+    else:
+        eligible = [n for n in grid
+                    if n == 0 or sweep[n]["cardiac_suppr"]
+                    >= RESIDUAL_ALPHA_EFF_LAMBDA * (1.0 - sweep[n]["alpha_ret"])]
     best = max(eligible, key=lambda n: sweep[n]["cardiac_suppr"]) if eligible else 0
     cleaned = _residual_obs(aas, qrs, a, b, best) if best > 0 else aas
     info = {"applied": True, "aas_neighbors": int(AAS_NEIGHBORS), "residual_obs_npc": int(best),
             "evoked_rms_before": ev0, "evoked_rms_after": sweep[best]["evoked_rms"],
             "residual_cardiac_suppr": sweep[best]["cardiac_suppr"],
             "residual_alpha_ret": sweep[best]["alpha_ret"],
-            "alpha_gate": RESIDUAL_ALPHA_GATE, "sweep": sweep}
+            "gate_mode": str(RESIDUAL_GATE_MODE), "alpha_gate": RESIDUAL_ALPHA_GATE,
+            "eff_lambda": float(RESIDUAL_ALPHA_EFF_LAMBDA), "sweep": sweep}
     print(f"  [RES-AAS] selected residual-OBS npc={best}: QRS-residual "
           f"{ev0:.3f} -> {sweep[best]['evoked_rms']:.3f}uV "
           f"(suppr {sweep[best]['cardiac_suppr']*100:.0f}%), "

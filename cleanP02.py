@@ -124,6 +124,8 @@ PARAM_MAP: dict[tuple, list] = {
     ("bcg", "aas_neighbors"): [(s08, "AAS_NEIGHBORS", int)],
     ("bcg", "residual_obs_npc_grid"): [(s08, "RESIDUAL_OBS_NPC_GRID", _ints)],
     ("bcg", "residual_alpha_gate"): [(s08, "RESIDUAL_ALPHA_GATE", float)],
+    ("bcg", "residual_gate_mode"): [(s08, "RESIDUAL_GATE_MODE", str)],
+    ("bcg", "residual_alpha_eff_lambda"): [(s08, "RESIDUAL_ALPHA_EFF_LAMBDA", float)],
     ("ica_opt", "duration_sec"): [(s10, "OPTUNA_DURATION_SEC", float)],
     ("ica_opt", "max_channel_removal_fraction"): [(s10, "MAX_CHANNEL_REMOVAL_FRACTION", float)],
     ("ica_opt", "flatline_grid"): [(s10, "FLATLINE_GRID", lambda v: [_crit(x) for x in v])],
